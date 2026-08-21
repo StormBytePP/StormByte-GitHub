@@ -1,0 +1,118 @@
+# Doxyfile — StormByte-GitHub
+# Doxygen configuration for HTML documentation (README + CHANGELOG + source browser)
+
+# ---------------------------------------------------------------------------
+# Project
+# ---------------------------------------------------------------------------
+PROJECT_NAME           = StormByte-GitHub
+PROJECT_BRIEF          = "Unified CLI for GitHub Actions caches, CI runs, git ops, submodules, dumps and releases."
+PROJECT_LOGO           =
+PROJECT_NUMBER         = 1.0.0
+
+OUTPUT_DIRECTORY       = ./docs
+CREATE_SUBDIRS         = YES
+ALLOW_UNICODE_NAMES    = YES
+
+# ---------------------------------------------------------------------------
+# Input
+# ---------------------------------------------------------------------------
+INPUT                  = ./StormByte-GitHub \
+                         README.md \
+                         CHANGELOG.md
+INPUT_ENCODING         = UTF-8
+RECURSIVE              = NO
+EXCLUDE                =
+EXCLUDE_SYMLINKS       = NO
+EXCLUDE_PATTERNS       = */.git/* \
+                         */docs/*
+EXAMPLE_PATH           =
+IMAGE_PATH             =
+
+# Main script has no extension; match it explicitly plus markdown
+FILE_PATTERNS          = *
+# Do not map to Bash: Doxygen has no Bash language support
+EXTENSION_MAPPING      =
+
+USE_MDFILE_AS_MAINPAGE = README.md
+
+# ---------------------------------------------------------------------------
+# Build
+# ---------------------------------------------------------------------------
+GENERATE_HTML          = YES
+GENERATE_LATEX         = NO
+GENERATE_RTF           = NO
+GENERATE_XML           = NO
+GENERATE_MAN           = NO
+GENERATE_DOCBOOK       = NO
+GENERATE_TREEVIEW      = YES
+DISABLE_INDEX          = NO
+ALPHABETICAL_INDEX     = YES
+
+# ---------------------------------------------------------------------------
+# HTML output
+# ---------------------------------------------------------------------------
+HTML_OUTPUT            = .
+HTML_FILE_EXTENSION    = .html
+HTML_HEADER            =
+HTML_FOOTER            =
+HTML_STYLESHEET        =
+HTML_EXTRA_STYLESHEET  =
+HTML_DYNAMIC_SECTIONS  = YES
+HTML_COLORSTYLE_HUE    = 220
+HTML_COLORSTYLE_SAT    = 100
+HTML_COLORSTYLE_GAMMA  = 80
+
+# ---------------------------------------------------------------------------
+# Source browser
+# ---------------------------------------------------------------------------
+SOURCE_BROWSER         = YES
+INLINE_SOURCES         = NO
+STRIP_CODE_COMMENTS    = NO
+REFERENCED_BY_RELATION = NO
+REFERENCES_RELATION    = NO
+VERBATIM_HEADERS       = YES
+FULL_PATH_NAMES        = YES
+STRIP_FROM_PATH        = .
+STRIP_FROM_INC_PATH    =
+
+# ---------------------------------------------------------------------------
+# Preprocessing (keep off so bash '#' is not treated as C comments)
+# ---------------------------------------------------------------------------
+ENABLE_PREPROCESSING   = NO
+MACRO_EXPANSION        = NO
+EXPAND_ONLY_PREDEF     = NO
+SEARCH_INCLUDES        = NO
+
+# ---------------------------------------------------------------------------
+# Warnings / quiet
+# ---------------------------------------------------------------------------
+QUIET                  = NO
+WARNINGS               = YES
+WARN_IF_UNDOCUMENTED   = NO
+WARN_IF_DOC_ERROR      = YES
+WARN_NO_PARAMDOC       = NO
+
+# ---------------------------------------------------------------------------
+# Graphs (optional; needs graphviz on the runner — already installed in CI)
+# ---------------------------------------------------------------------------
+HAVE_DOT               = YES
+DOT_IMAGE_FORMAT       = png
+CLASS_DIAGRAMS         = NO
+CLASS_GRAPH            = NO
+COLLABORATION_GRAPH    = NO
+INCLUDE_GRAPH          = NO
+INCLUDED_BY_GRAPH      = NO
+DIRECTORY_GRAPH        = NO
+CALL_GRAPH             = NO
+CALLER_GRAPH           = NO
+
+# ---------------------------------------------------------------------------
+# Misc
+# ---------------------------------------------------------------------------
+ALIASES                =
+TAB_SIZE               = 4
+MARKDOWN_SUPPORT       = YES
+AUTOLINK_SUPPORT       = YES
+INLINE_INHERITED_MEMB  = NO
+
+# End of Doxyfile
