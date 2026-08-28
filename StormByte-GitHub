@@ -1237,7 +1237,7 @@ commit_submodules_if_needed() {
 	git -C "$dir" status --short | sed 's/^/    /'
 
 	if [[ "$DRY_RUN" == "1" ]]; then
-		log "  [dry-run] would commit (no push): chore: update dependencies"
+		log "  [dry-run] would commit (no push)"
 		return 0
 	fi
 
@@ -1585,6 +1585,10 @@ cmd_submodules_update_one() {
 				warn "checkout ${target} failed for ${plan_name[$i]}"
 				continue
 			fi
+		fi
+		if ! git -C "$dir" add -- "${plan_path[$i]}"; then
+			warn "git add ${plan_path[$i]} failed for ${plan_name[$i]}"
+			continue
 		fi
 		short="$(git -C "$abs" rev-parse --short HEAD 2>/dev/null || echo "?")"
 		ok "${plan_name[$i]} → ${short} (${plan_new[$i]})"
