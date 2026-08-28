@@ -1277,6 +1277,34 @@ _sm_prompt_ref() {
 	printf '%s\n' "$reply"
 }
 
+_sm_emit_plan() {
+	printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+		"${1}" "${2}" "${3:--}" "${4:-0}" "${5:-0}" "${6:-0}"
+}
+
+_sm_gitmodules_branch() {
+	local dir="$1" sm_name="$2" sm_path="$3"
+	local b key path
+
+	b="$(git -C "$dir" config -f .gitmodules --get "submodule.${sm_name}.branch" 2>/dev/null || true)"
+	if [[ -n "$b" ]]; then
+		printf '%s\n' "$b"
+		return 0
+	fi
+	while IFS= read -r key; do
+		[[ "$key" == *.path ]] || continue
+		path="$(git -C "$dir" config -f .gitmodules --get "$key" 2>/dev/null || true)"
+		if [[ "$path" == "$sm_path" ]]; then
+			b="$(git -C "$dir" config -f .gitmodules --get "${key%.path}.branch" 2>/dev/null || true)"
+			if [[ -n "$b" ]]; then
+				printf '%s\n' "$b"
+				return 0
+			fi
+		fi
+	done < <(git -C "$dir" config -f .gitmodules --name-only --get-regexp '^submodule\..*\.path$' 2>/dev/null)
+	return 1
+}
+
 _sm_current_label() {
 	local kind="$1" label="$2" sha="$3"
 	local short="${sha:0:7}"
@@ -1360,12 +1388,12 @@ _sm_latest_in_family() {
 # stdout: planned \t action \t target \t n_upd \t n_re \t n_unres
 _sm_plan_tag() {
 	local abs="$1" label="$2" sha="$3"
-	local next next_rc=0 cmp_sha reply latest peel_latest
+	local next next_rc=0 cmp_sha reply latest
 
 	if ! git_object_exists "$abs" "refs/sb-gh/tags/${label}" \
 		&& ! git_object_exists "$abs" "refs/tags/${label}" \
 		&& ! git_object_exists "$abs" "$label"; then
-		printf '%s\n' "UNRESOLVED	skip		0	0	1"
+		_sm_emit_plan "UNRESOLVED" "skip" "-" 0 0 1
 		return 0
 	fi
 
@@ -1374,30 +1402,28 @@ _sm_plan_tag() {
 	if (( next_rc != 0 )); then
 		reply="$(_sm_prompt_ref "$abs" "$label" "no unique successor in family")" || reply=""
 		if [[ -z "$reply" ]]; then
-			printf '%s\n' "UNRESOLVED	skip		0	0	1"
+			_sm_emit_plan "UNRESOLVED" "skip" "-" 0 0 1
 		else
-			printf '%s\n' "${reply}	tag	${reply}	1	0	0"
+			_sm_emit_plan "${reply}" "tag" "${reply}" 1 0 0
 		fi
 		return 0
 	fi
 
-	# Tag superior en la familia: update gana siempre al re-release.
 	if [[ -n "$next" && "$next" != "$label" ]]; then
 		latest="$(_sm_latest_in_family "$abs" "$label" || printf '%s' "$next")"
-		printf '%s\n' "${latest}	tag	${latest}	1	0	0"
+		_sm_emit_plan "${latest}" "tag" "${latest}" 1 0 0
 		return 0
 	fi
 
-	# Misma tag, otro SHA → re-release.
 	cmp_sha="$(git_peel_ref "$abs" "refs/sb-gh/tags/${label}" 2>/dev/null \
 		|| git_peel_ref "$abs" "refs/tags/${label}" 2>/dev/null \
 		|| true)"
 	if [[ -n "$cmp_sha" && -n "$sha" && "$cmp_sha" != "$sha" ]]; then
-		printf '%s\n' "re-release (${cmp_sha:0:7})	tag	${label}	0	1	0"
+		_sm_emit_plan "re-release (${cmp_sha:0:7})" "tag" "${label}" 0 1 0
 		return 0
 	fi
 
-	printf '%s\n' "No changes	keep		0	0	0"
+	_sm_emit_plan "No changes" "keep" "-" 0 0 0
 }
 
 cmd_submodules_update_one() {
@@ -1411,6 +1437,7 @@ cmd_submodules_update_one() {
 	local -a shadow_repos=()
 	local i action target reply gm_branch tag_at seed
 	local plan_line d_upd d_re d_unres
+	local sha_new got
 
 	_sm_shadow_cleanup() {
 		local r
@@ -1441,7 +1468,7 @@ cmd_submodules_update_one() {
 		[[ -z "$sm_name" || -z "$sm_path" ]] && continue
 		abs="$dir/$sm_path"
 		action="keep"
-		target=""
+		target="-"
 		planned="No changes"
 		d_upd=0 d_re=0 d_unres=0
 
@@ -1462,10 +1489,12 @@ cmd_submodules_update_one() {
 			warn "shadow fetch failed for $sm_path"
 		fi
 		git -C "$abs" fetch origin --tags --force --prune >/dev/null 2>&1 || true
+		git -C "$abs" fetch origin master --prune >/dev/null 2>&1 || true
 
 		IFS=$'\t' read -r kind label sha < <(git_sm_classify "$dir" "$sm_name" "$abs")
-		gm_branch="$(git -C "$dir" config -f .gitmodules --get "submodule.${sm_name}.branch" 2>/dev/null || true)"
+		gm_branch="$(_sm_gitmodules_branch "$dir" "$sm_name" "$sm_path" || true)"
 
+		# branch=master gana a "este SHA es una tag"
 		if [[ "$gm_branch" == "master" ]]; then
 			kind="branch"
 			label="master"
@@ -1483,9 +1512,11 @@ cmd_submodules_update_one() {
 		current_lbl="$(_sm_current_label "$kind" "$label" "$sha")"
 
 		if [[ "$kind" == "branch" ]]; then
-			planned_sha="$(git_peel_ref "$abs" "refs/sb-gh/heads/${label}" 2>/dev/null || true)"
+			planned_sha="$(git_peel_ref "$abs" "refs/sb-gh/heads/${label}" 2>/dev/null \
+				|| git -C "$abs" rev-parse "origin/${label}" 2>/dev/null \
+				|| true)"
 			if [[ -z "$planned_sha" ]]; then
-				err "shadow origin/${label} missing for ${sm_name}"
+				err "origin/${label} missing for ${sm_name}"
 				_sm_shadow_cleanup
 				if [[ "$stashed" -eq 1 ]]; then
 					git_stash_pop_safe "$dir" >/dev/null 2>&1 || true
@@ -1495,8 +1526,9 @@ cmd_submodules_update_one() {
 			if [[ "$planned_sha" == "$sha" ]]; then
 				planned="No changes"
 				action="keep"
+				target="-"
 			else
-				planned="${label} (${planned_sha:0:7})"
+				planned="master (${planned_sha:0:7})"
 				action="branch"
 				target="$label"
 				n_upd=$((n_upd + 1))
@@ -1522,6 +1554,7 @@ cmd_submodules_update_one() {
 			else
 				planned="No changes"
 				action="keep"
+				target="-"
 			fi
 		fi
 
@@ -1572,7 +1605,7 @@ cmd_submodules_update_one() {
 		action="${plan_action[$i]}"
 		target="${plan_target[$i]}"
 		abs="$dir/${plan_path[$i]}"
-		[[ "$action" == "keep" || "$action" == "skip" ]] && continue
+		[[ "$action" == "keep" || "$action" == "skip" || "$target" == "-" ]] && continue
 		if [[ "$action" == "branch" ]]; then
 			git -C "$abs" fetch origin --prune >/dev/null 2>&1 || true
 			if ! git -C "$abs" checkout -B "$target" "origin/${target}" >/dev/null 2>&1; then
@@ -1586,8 +1619,14 @@ cmd_submodules_update_one() {
 				continue
 			fi
 		fi
-		if ! git -C "$dir" add -- "${plan_path[$i]}"; then
-			warn "git add ${plan_path[$i]} failed for ${plan_name[$i]}"
+		sha_new="$(git -C "$abs" rev-parse HEAD)"
+		if ! git -C "$dir" update-index --cacheinfo "160000,${sha_new},${plan_path[$i]}"; then
+			warn "update-index ${plan_path[$i]} failed for ${plan_name[$i]}"
+			continue
+		fi
+		got="$(git -C "$dir" rev-parse ":${plan_path[$i]}" 2>/dev/null || true)"
+		if [[ "$got" != "$sha_new" ]]; then
+			err "gitlink not staged for ${plan_name[$i]} (want ${sha_new:0:7}, index ${got:0:7})"
 			continue
 		fi
 		short="$(git -C "$abs" rev-parse --short HEAD 2>/dev/null || echo "?")"
