@@ -4,46 +4,34 @@
 # =============================================================================
 set -euo pipefail
 
-# -----------------------------------------------------------------------------
-# Version requirements
-# -----------------------------------------------------------------------------
 readonly STORMBYTE_GITHUB_VERSION="1.1.0"
 readonly REQUIRE_STORMBYTE_FUNCTIONS="1.3.0"
 readonly REQUIRE_STORMBYTE_FUNCTIONS_GIT="1.3.0"
+readonly REQUIRE_STORMBYTE_FUNCTIONS_GH="1.0.0"
 
-# -----------------------------------------------------------------------------
-# Locate and load libraries
-# -----------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-if [[ -f "${SCRIPT_DIR}/functions.sh" ]]; then
-	# shellcheck source=/dev/null
-	source "${SCRIPT_DIR}/functions.sh"
-elif [[ -f "/lib/StormByte/functions.sh" ]]; then
-	# shellcheck source=/dev/null
-	source "/lib/StormByte/functions.sh"
-else
-	printf 'ERROR: StormByte functions.sh not found\n' >&2
-	exit 1
-fi
+_sb_source_lib() {
+	local name="$1"
+	if [[ -f "${SCRIPT_DIR}/${name}" ]]; then
+		# shellcheck source=/dev/null
+		source "${SCRIPT_DIR}/${name}"
+	elif [[ -f "/lib/StormByte/${name}" ]]; then
+		# shellcheck source=/dev/null
+		source "/lib/StormByte/${name}"
+	else
+		printf 'ERROR: StormByte %s not found\n' "$name" >&2
+		exit 1
+	fi
+}
 
+_sb_source_lib functions.sh
 require_version "${STORMBYTE_FUNCTIONS_VERSION}" "${REQUIRE_STORMBYTE_FUNCTIONS}" "StormByte functions"
-
-if [[ -f "${SCRIPT_DIR}/git.sh" ]]; then
-	# shellcheck source=/dev/null
-	source "${SCRIPT_DIR}/git.sh"
-elif [[ -f "/lib/StormByte/git.sh" ]]; then
-	# shellcheck source=/dev/null
-	source "/lib/StormByte/git.sh"
-else
-	displayError "StormByte git.sh not found"
-fi
-
+_sb_source_lib git.sh
 require_version "${STORMBYTE_FUNCTIONS_GIT_VERSION}" "${REQUIRE_STORMBYTE_FUNCTIONS_GIT}" "StormByte git helpers"
+_sb_source_lib gh.sh
+require_version "${STORMBYTE_FUNCTIONS_GH_VERSION}" "${REQUIRE_STORMBYTE_FUNCTIONS_GH}" "StormByte gh helpers"
 
-# -----------------------------------------------------------------------------
-# Identity
-# -----------------------------------------------------------------------------
 readonly SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly CONFIG_FILE="${HOME}/.StormByte-GitHub.conf"
 
@@ -52,6 +40,7 @@ PAGE_LIMIT="${PAGE_LIMIT:-100}"
 MAX_PAGES="${MAX_PAGES:-0}"
 RUN_LIMIT="${RUN_LIMIT:-0}"
 ONLY_FAILED="${ONLY_FAILED:-0}"
+SM_CONFIRM="${SM_CONFIRM:-0}"
 
 _ENV_ROOT="${ROOT-}"
 _ENV_OUT="${OUT-}"
@@ -66,13 +55,12 @@ FORK_ROOT=""
 LAST_COUNT=0
 LAST_BYTES=0
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Configuration
-# -----------------------------------------------------------------------------
+# =============================================================================
 
 prompt_config() {
 	local input default_root
-
 	default_root="/home/$(id -un 2>/dev/null || echo user)"
 
 	printf '  %s┌──────────────────────────────────────────────────────┐%s\n' "${_CLR_BOLD_BLUE}" "${_CLR_RESET}"
@@ -113,7 +101,7 @@ prompt_config() {
 		read -e -r -p "  ROOT [${default_root}]: " input
 		input="$(path_normalize "${input:-$default_root}")"
 		if [[ -d "$input" ]]; then
-			ROOT="$(cd "$input" && pwd)"
+			ROOT="$(dir_realpath "$input")"
 			break
 		fi
 		echo "  → Directory does not exist: $input"
@@ -128,11 +116,11 @@ prompt_config() {
 		read -e -r -p "  OUT [/tmp]: " input
 		input="$(path_normalize "${input:-/tmp}")"
 		if [[ -d "$input" ]]; then
-			OUT="$(cd "$input" && pwd)"
+			OUT="$(dir_realpath "$input")"
 			break
 		fi
 		if mkdir -p "$input" 2>/dev/null; then
-			OUT="$(cd "$input" && pwd)"
+			OUT="$(dir_realpath "$input")"
 			break
 		fi
 		echo "  → Cannot create directory: $input"
@@ -153,7 +141,7 @@ prompt_config() {
 		fi
 		input="$(path_normalize "$input")"
 		if [[ -d "$input" ]]; then
-			FORK_ROOT="$(cd "$input" && pwd)"
+			FORK_ROOT="$(dir_realpath "$input")"
 			break
 		fi
 		echo "  → Directory does not exist: $input"
@@ -167,9 +155,7 @@ prompt_config() {
 		echo "OWNER=$OWNER"
 		echo "ROOT=$ROOT"
 		echo "OUT=$OUT"
-		if [[ -n "$FORK_ROOT" ]]; then
-			echo "FORK_ROOT=$FORK_ROOT"
-		fi
+		[[ -n "$FORK_ROOT" ]] && echo "FORK_ROOT=$FORK_ROOT"
 	} > "$CONFIG_FILE"
 
 	ok "Configuration written to $CONFIG_FILE"
@@ -177,10 +163,7 @@ prompt_config() {
 }
 
 load_or_create_config() {
-	if [[ ! -f "$CONFIG_FILE" ]]; then
-		prompt_config
-	fi
-
+	[[ -f "$CONFIG_FILE" ]] || prompt_config
 	load_safe_config "$CONFIG_FILE" OWNER ROOT OUT FORK_ROOT
 
 	[[ -n "$_ENV_ROOT"      ]] && ROOT="$_ENV_ROOT"
@@ -192,38 +175,28 @@ load_or_create_config() {
 	[[ -n "$ROOT"  ]] || displayError "ROOT is not set in $CONFIG_FILE (or ROOT env)"
 	[[ -n "$OUT"   ]] || displayError "OUT is not set in $CONFIG_FILE (or OUT env)"
 
-	if [[ -d "$ROOT" ]]; then
-		ROOT="$(cd "$ROOT" && pwd)"
-	fi
-	if [[ ! -d "$ROOT" ]]; then
-		displayError "ROOT directory does not exist: $ROOT"
-	fi
+	ROOT="$(path_normalize "$ROOT")"
+	require_dir "$ROOT"
+	ROOT="$(dir_realpath "$ROOT")"
 
 	ensure_dir "$OUT"
-	if [[ -d "$OUT" ]]; then
-		OUT="$(cd "$OUT" && pwd)"
-	fi
+	OUT="$(path_normalize "$OUT")"
+	OUT="$(dir_realpath "$OUT")"
 
 	if [[ -n "$FORK_ROOT" ]]; then
-		if [[ -d "$FORK_ROOT" ]]; then
-			FORK_ROOT="$(cd "$FORK_ROOT" && pwd)"
-		else
-			displayError "FORK_ROOT directory does not exist: $FORK_ROOT"
-		fi
+		FORK_ROOT="$(path_normalize "$FORK_ROOT")"
+		require_dir "$FORK_ROOT"
+		FORK_ROOT="$(dir_realpath "$FORK_ROOT")"
 	fi
 }
 
 fork_effective_root() {
-	if [[ -n "$FORK_ROOT" ]]; then
-		printf '%s\n' "$FORK_ROOT"
-	else
-		printf '%s\n' "$ROOT"
-	fi
+	printf '%s\n' "${FORK_ROOT:-$ROOT}"
 }
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # UI
-# -----------------------------------------------------------------------------
+# =============================================================================
 
 display_header() {
 	local line1="StormByte-GitHub  v${STORMBYTE_GITHUB_VERSION}"
@@ -234,28 +207,24 @@ display_header() {
 	(( ${#line2} > inner_w )) && inner_w=${#line2}
 	inner_w=$((inner_w + 4))
 	(( inner_w < 50 )) && inner_w=50
-
 	border_mid="$(printf '═%.0s' $(seq 1 "$inner_w"))"
 
 	_sb_center() {
-		local text="$1"
-		local tw=${#text}
-		local total=$inner_w
-		local left=$(( (total - tw) / 2 ))
-		local right=$(( total - tw - left ))
+		local text tw total left right
+		text="${1-}"
+		tw=${#text}
+		total=$inner_w
+		left=$(( (total - tw) / 2 ))
+		(( left < 0 )) && left=0
+		right=$(( total - tw - left ))
+		(( right < 0 )) && right=0
 		printf '%*s%s%*s' "$left" '' "$text" "$right" ''
 	}
 
 	printf '\n'
 	printf '  %s╔%s╗%s\n' "${_CLR_BOLD_BLUE}" "$border_mid" "${_CLR_RESET}"
-	printf '  %s║%s%s%s║%s\n' \
-		"${_CLR_BOLD_BLUE}" "${_CLR_RESET}${_CLR_BOLD}" \
-		"$(_sb_center "$line1")" \
-		"${_CLR_BOLD_BLUE}" "${_CLR_RESET}"
-	printf '  %s║%s%s%s║%s\n' \
-		"${_CLR_BOLD_BLUE}" "${_CLR_RESET}" \
-		"$(_sb_center "$line2")" \
-		"${_CLR_BOLD_BLUE}" "${_CLR_RESET}"
+	printf '  %s║%s%s%s║%s\n' "${_CLR_BOLD_BLUE}" "${_CLR_RESET}${_CLR_BOLD}" "$(_sb_center "$line1")" "${_CLR_BOLD_BLUE}" "${_CLR_RESET}"
+	printf '  %s║%s%s%s║%s\n' "${_CLR_BOLD_BLUE}" "${_CLR_RESET}" "$(_sb_center "$line2")" "${_CLR_BOLD_BLUE}" "${_CLR_RESET}"
 	printf '  %s╚%s╝%s\n' "${_CLR_BOLD_BLUE}" "$border_mid" "${_CLR_RESET}"
 	printf '\n'
 }
@@ -330,8 +299,7 @@ ${_CLR_BOLD_CYAN}submodules init|deinit|update|list${_CLR_RESET}  [dir-spec] [--
 			B2 no master, checkout is not a tag (e.g. master was removed)
 				Pin to the latest tag of the inferred family (intentional
 				downgrade is allowed). Else the newest recognised release.
-			Unrecognised pins → UNRESOLVED. On a TTY you can type a ref;
-			--confirm / non-TTY skips those rows.
+			Unrecognised pins → UNRESOLVED and are skipped.
 
 			Prints MODULE / CURRENT / PLANNED, then asks [y/N] unless
 			--confirm or DRY_RUN=1. Parent dirty tree is stashed and restored.
@@ -367,28 +335,18 @@ ${_CLR_BOLD_CYAN}repos release${_CLR_RESET}  [dir-spec] [version] [--list | --de
 
 	${_CLR_BOLD}--list${_CLR_RESET} (dir and version optional)
 	List GitHub Releases (not plain tags).
-	Directory selection works like other commands (all under ROOT, one dir,
-	or !exclusions). If <version> is given, only that release is shown.
-	Tags that exist without a matching GitHub Release are reported as a
-	friendly note (not an error).
-	Positional parsing when --list is present:
-		(none)              → all repos, all releases
-		<dir-spec>          → selected repos, all releases
-		<version>           → all repos, that version only (SEMVER-shaped)
-		<dir-spec> <version>→ selected repos, that version only
+	If <version> is given, only that release is shown.
+	Tags without a matching GitHub Release are a note, not an error.
 
 	${_CLR_BOLD}--delete${_CLR_RESET}  <dir> <version>
 	Remove GitHub Release and tag (local + origin). Confirm with yes.
-	--skip-ci is ignored. No-op if neither exists.
 
 	${_CLR_BOLD}CREATE${_CLR_RESET} (default)  <dir> <version> [--skip-ci]
 	Tag, push and create a GitHub Release.
 	Requires clean tree on master/main, OWNER remote, and CHANGELOG.md with:
 		## [<version>] - YYYY-MM-DD
-	Notes come from that section. Waits for CI unless --skip-ci
-	(Ctrl-C during wait: no tag yet). Same version recreates tag/release.
-	Pre-releases (e.g. 1.0.0-rc.1) use gh --prerelease.
-	Interactive confirmation (type yes). DRY_RUN supported for create/delete.
+	Waits for CI unless --skip-ci. Same version recreates tag/release.
+	Pre-releases use --prerelease. Confirmation is exactly "yes".
 
 ${_CLR_BOLD_CYAN}clone-all${_CLR_RESET}
 	Clone all public repositories of \$OWNER that are missing under \$ROOT.
@@ -401,143 +359,65 @@ ${_CLR_BOLD_CYAN}fork status|sync|branch-status${_CLR_RESET}  [dir-spec]
 	status         → behind/ahead vs upstream (forks)
 	sync           → update ONLY master if behind upstream
 	branch-status  → local branches ≠ master: CLEAN/CONFLICTS vs merge into master
-					(merge-tree; NOTE: local-only if not pushed; neutral if none)
+					(merge-tree; local-only if not pushed)
 
-${_CLR_BOLD_CYAN}test asan|tsan${_CLR_RESET}  [dir-spec]
-	Build and run AddressSanitizer / ThreadSanitizer tests.
-	Supports the same directory selection as other multi-repo commands
-	(all, one, or !exclusions). Relative paths resolve under \$ROOT;
-	absolute and ~/ paths are used as-is.
-
-	The build directory is created by the script and always removed at the end
-	(success or failure). If the build directory already exists the command
-	aborts for safety for that repository.
-
-	Options:
-	--builddir DIR          Build directory relative to repo root
-							(default: build-asan / build-tsan)
-	--testdir DIR           Directory for ctest (default: \$builddir/test)
-	--outfile FILE          Report file (default: /tmp/<repo>_asan|tsan_report.txt)
-							Only written when an error occurs.
-	--cmake-options "opts"  Extra options passed to cmake (after sanitizer flags)
-	--executable PATH       Run this binary directly (relative to builddir or absolute)
-	--test REGEX            Run ctest -R REGEX instead of all tests
-	--asan-options "opts"   Extra ASAN_OPTIONS (only for asan)
-	--tsan-options "opts"   Extra TSAN_OPTIONS (only for tsan)
-	--verbose               Show full configure + compile output
-
-	Execution priority (per repository):
-	1. --executable  → run the binary directly
-	2. --test        → ctest -R REGEX
-	3. (none)        → ctest (all tests)
-
-${_CLR_BOLD}EXAMPLES${_CLR_RESET}
-${SCRIPT_NAME} cache delete '!multimedia'
-${SCRIPT_NAME} ci start --failed
-${SCRIPT_NAME} repos list
-${SCRIPT_NAME} repos dump ./base type=cmake 200
-${SCRIPT_NAME} repos status
-${SCRIPT_NAME} repos push '!multimedia'
-${SCRIPT_NAME} repos release --list
-${SCRIPT_NAME} repos release database --list
-${SCRIPT_NAME} repos release --list 1.0.0
-${SCRIPT_NAME} repos release database 1.0.0 --list
-${SCRIPT_NAME} repos release database 1.0.0
-${SCRIPT_NAME} repos release database 1.0.0 --skip-ci
-${SCRIPT_NAME} repos release database 1.0.0 --delete
-DRY_RUN=1 ${SCRIPT_NAME} repos release database 1.0.0
-ROOT=~/Software ${SCRIPT_NAME} git sync
-FORK_ROOT=~/Forks ${SCRIPT_NAME} fork status
-FORK_ROOT=~/Forks ${SCRIPT_NAME} fork sync
-${SCRIPT_NAME} search \"mimalloc\"
-${SCRIPT_NAME} clone-all
-${SCRIPT_NAME} test asan
-${SCRIPT_NAME} test asan multimedia
-${SCRIPT_NAME} test tsan '!multimedia'
-${SCRIPT_NAME} test asan database --cmake-options \"-DENABLE_FOO=ON\" --verbose
-${SCRIPT_NAME} test asan multimedia --executable bin/my_test --outfile /tmp/report.txt
-
-${_CLR_BOLD}NOTES${_CLR_RESET}
-• Repositories must belong to the configured OWNER (or OWNER env override).
-• Omitting the dir-spec walks every immediate subdirectory of the effective root.
-• Running with no arguments shows this help.
+${_CLR_BOLD_CYAN}test asan|tsan${_CLR_RESET}  [dir-spec] [options]
+	Configure + build + run sanitizer tests. Build dir must not already exist
+	and is removed on exit. Options: --builddir --testdir --outfile
+	--cmake-options --executable --test --asan-options --tsan-options --verbose
 EOF
 }
 
 usage_error() {
 	err "$1"
-	echo
-	echo "Accepted: $2"
-	echo "Use '${SCRIPT_NAME} help' for full help."
-	exit 1
+	[[ -n "${2-}" ]] && printf '  usage: %s %s\n' "$SCRIPT_NAME" "$2" >&2
+	exit 2
 }
 
-# -----------------------------------------------------------------------------
-# Status colours — coherent palette, not a rainbow
-#   dark green  (_CLR_GREEN)      idle / no work
-#   light green (_CLR_BOLD_GREEN) an update or action that did work
-#   yellow                        warnings
-#   red                           failures
-# Headers (section / display_header) stay as they are.
-# -----------------------------------------------------------------------------
-
-_clr_wrap() {
-	printf '%s%s%s' "$1" "$2" "${_CLR_RESET}"
-}
+_clr_wrap() { printf '%s%s%s' "$1" "$2" "${_CLR_RESET}"; }
 
 _clr_planned() {
-	local text="$1"
-	local low="${text,,}"
+	local text low
+	text="${1-}"
+	low="${text,,}"
 	case "$low" in
-		"no changes"|"keep")
-			_clr_wrap "${_CLR_GREEN}" "$text"
-			;;
-		unresolved*|missing*|error*)
-			_clr_wrap "${_CLR_BOLD_RED}" "$text"
-			;;
-		*)
-			_clr_wrap "${_CLR_BOLD_GREEN}" "$text"
-			;;
+		"no changes"|keep) _clr_wrap "${_CLR_GREEN}" "$text" ;;
+		unresolved*|missing*|error*) _clr_wrap "${_CLR_BOLD_RED}" "$text" ;;
+		*) _clr_wrap "${_CLR_BOLD_GREEN}" "$text" ;;
 	esac
 }
 
 _clr_status_label() {
-	local label="$1"
-	case "$label" in
-		OK)             _clr_wrap "${_CLR_GREEN}" "$label" ;;
-		DIRTY|UNPUSHED) _clr_wrap "${_CLR_BOLD_YELLOW}" "$label" ;;
-		DIRTY+UNPUSHED) _clr_wrap "${_CLR_BOLD_RED}" "$label" ;;
-		*)              printf '%s' "$label" ;;
+	case "$1" in
+		OK)             _clr_wrap "${_CLR_GREEN}" "$1" ;;
+		DIRTY|UNPUSHED) _clr_wrap "${_CLR_BOLD_YELLOW}" "$1" ;;
+		DIRTY+UNPUSHED) _clr_wrap "${_CLR_BOLD_RED}" "$1" ;;
+		*)              printf '%s' "$1" ;;
 	esac
 }
 
 _clr_merge_label() {
-	local label="$1"
-	case "$label" in
-		CLEAN)     _clr_wrap "${_CLR_GREEN}" "$label" ;;
-		CONFLICTS) _clr_wrap "${_CLR_BOLD_RED}" "$label" ;;
-		*)         printf '%s' "$label" ;;
+	case "$1" in
+		CLEAN)     _clr_wrap "${_CLR_GREEN}" "$1" ;;
+		CONFLICTS) _clr_wrap "${_CLR_BOLD_RED}" "$1" ;;
+		*)         printf '%s' "$1" ;;
 	esac
 }
 
 _clr_ci_status() {
-	local status="$1"
-	case "${status,,}" in
-		completed)            _clr_wrap "${_CLR_GREEN}" "$status" ;;
-		in_progress|queued|pending|waiting|requested)
-			_clr_wrap "${_CLR_CYAN}" "$status" ;;
-		*)                    printf '%s' "$status" ;;
+	case "${1,,}" in
+		completed) _clr_wrap "${_CLR_GREEN}" "$1" ;;
+		in_progress|queued|pending|waiting|requested) _clr_wrap "${_CLR_CYAN}" "$1" ;;
+		*) printf '%s' "$1" ;;
 	esac
 }
 
 _clr_ci_conclusion() {
-	local conclusion="$1"
-	case "${conclusion,,}" in
-		success)  _clr_wrap "${_CLR_GREEN}" "$conclusion" ;;
-		failure|cancelled|timed_out|startup_failure)
-			_clr_wrap "${_CLR_BOLD_RED}" "$conclusion" ;;
-		-)        printf '%s' "$conclusion" ;;
-		*)        _clr_wrap "${_CLR_BOLD_YELLOW}" "$conclusion" ;;
+	case "${1,,}" in
+		success) _clr_wrap "${_CLR_GREEN}" "$1" ;;
+		failure|cancelled|timed_out|startup_failure) _clr_wrap "${_CLR_BOLD_RED}" "$1" ;;
+		-) printf '%s' "$1" ;;
+		*) _clr_wrap "${_CLR_BOLD_YELLOW}" "$1" ;;
 	esac
 }
 
@@ -545,59 +425,31 @@ _idle() {
 	printf "  ${_CLR_GREEN}OK${_CLR_RESET} ${_CLR_DIM}│${_CLR_RESET} %s\n" "$*"
 }
 
-# -----------------------------------------------------------------------------
-# Path / selection helpers
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Walk
+# =============================================================================
 
 resolve_repo_dir() {
-	local spec="$1"
-	local base_root="${2:-$ROOT}"
-
-	while [[ "$spec" == */ ]]; do
-		spec="${spec%/}"
-	done
-
-	if [[ "$spec" == "~" ]]; then
-		spec="$HOME"
-	elif [[ "$spec" == "~/"* ]]; then
-		spec="$HOME/${spec:2}"
+	local spec="$1" base_root="${2:-$ROOT}" candidate
+	candidate="$(path_under_root "$base_root" "$spec")"
+	if [[ -d "$candidate" ]]; then
+		dir_realpath "$candidate"
+	else
+		printf '%s\n' "$candidate"
 	fi
-
-	if [[ "$spec" == /* ]]; then
-		printf '%s\n' "$spec"
-		return 0
-	fi
-
-	if [[ "$spec" == */* || "$spec" == ./* || "$spec" == ../* ]]; then
-		if [[ -d "$spec" ]]; then
-			(cd "$spec" && pwd)
-		else
-			printf '%s\n' "$spec"
-		fi
-		return 0
-	fi
-
-	printf '%s\n' "$base_root/$spec"
 }
-
-# -----------------------------------------------------------------------------
-# Shared walk helper
-# -----------------------------------------------------------------------------
 
 __walk_repos=0
 __walk_total=0
 __walk_bytes=0
 
 foreach_repo() {
-	local callback="$1"
-	local target="${2:-}"
-	local walk_root="${3:-$ROOT}"
+	local callback="$1" target="${2:-}" walk_root="${3:-$ROOT}"
 	local dir name repo path
 
 	__walk_repos=0
 	__walk_total=0
 	__walk_bytes=0
-
 	parse_selection_spec "$target"
 
 	if [[ ${#INCLUDE_ITEMS[@]} -eq 1 && ${#EXCLUDE_ITEMS[@]} -eq 0 ]]; then
@@ -617,9 +469,7 @@ foreach_repo() {
 	for path in "$walk_root"/*/; do
 		dir="${path%/}"
 		name="$(basename "$dir")"
-
 		should_process_item "$name" || continue
-
 		section "$name"
 		if [[ ! -d "$dir/.git" && ! -f "$dir/.git" ]]; then
 			warn "Not a git repo — skip"
@@ -639,57 +489,35 @@ foreach_repo() {
 }
 
 print_summary() {
-	local label="$1"
-	local count="$2"
+	local label="$1" count="$2"
 	log ""
-	printf '  %s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n' \
-		"${_CLR_DIM}" "${_CLR_RESET}"
+	printf '  %s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n' "${_CLR_DIM}" "${_CLR_RESET}"
 	printf "  ${_CLR_BOLD}DONE${_CLR_RESET}  ${_CLR_DIM}repos:${_CLR_RESET} %s  ${_CLR_DIM}│${_CLR_RESET}  ${_CLR_DIM}%s:${_CLR_RESET} %s\n" \
 		"$__walk_repos" "$label" "$count"
 	log ""
 }
 
 print_summary_sized() {
-	local label="$1"
-	local count="$2"
-	local bytes="$3"
+	local label="$1" count="$2" bytes="$3"
 	log ""
-	printf '  %s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n' \
-		"${_CLR_DIM}" "${_CLR_RESET}"
+	printf '  %s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n' "${_CLR_DIM}" "${_CLR_RESET}"
 	printf "  ${_CLR_BOLD}DONE${_CLR_RESET}  ${_CLR_DIM}repos:${_CLR_RESET} %s  ${_CLR_DIM}│${_CLR_RESET}  ${_CLR_DIM}%s:${_CLR_RESET} %s  ${_CLR_DIM}│${_CLR_RESET}  ${_CLR_DIM}size:${_CLR_RESET} %s\n" \
 		"$__walk_repos" "$label" "$count" "$(human_size "$bytes")"
 	log ""
 }
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # cache
-# -----------------------------------------------------------------------------
-
-_cache_list_rows() {
-	local repo="$1"
-	gh cache list -R "$repo" --limit "$PAGE_LIMIT" \
-		--json id,key,sizeInBytes \
-		--jq '.[] | "\(.id)\t\(.sizeInBytes // 0)\t\(.key)"' \
-		2>/dev/null || true
-}
-
-# Returns 0 if key matches the current CACHE_NAME_FILTER (bash glob)
-_cache_key_matches() {
-	local key="$1"
-	[[ -z "$CACHE_NAME_FILTER" ]] && return 0
-	# shellcheck disable=SC2254
-	[[ "$key" == $CACHE_NAME_FILTER ]]
-}
+# =============================================================================
 
 cmd_cache_show_one() {
 	local dir="$1" repo="$2"
-	local count=0 bytes=0 id size key entry rest hsz
+	local count=0 bytes=0 id size key entry rest
 	local -a entries=()
 
 	info "Remote" "$repo"
 	[[ -n "$CACHE_NAME_FILTER" ]] && info "Filter" "--name $CACHE_NAME_FILTER"
-
-	mapfile -t entries < <(_cache_list_rows "$repo")
+	mapfile -t entries < <(gh_cache_list "$repo" "$PAGE_LIMIT")
 
 	if [[ ${#entries[@]} -eq 0 ]]; then
 		_idle "No caches"
@@ -705,13 +533,8 @@ cmd_cache_show_one() {
 		key="${rest#*$'\t'}"
 		[[ -z "$id" ]] && continue
 		[[ "$size" =~ ^[0-9]+$ ]] || size=0
-
-		if ! _cache_key_matches "$key"; then
-			continue
-		fi
-
-		hsz="$(human_size "$size")"
-		printf "  %-12s  %-10s  %s\n" "id=$id" "$hsz" "$key"
+		gh_key_matches "$key" "$CACHE_NAME_FILTER" || continue
+		printf "  %-12s  %-10s  %s\n" "id=$id" "$(human_size "$size")" "$key"
 		count=$((count + 1))
 		bytes=$((bytes + size))
 	done
@@ -733,8 +556,7 @@ cmd_cache_list_one() {
 
 	info "Remote" "$repo"
 	[[ -n "$CACHE_NAME_FILTER" ]] && info "Filter" "--name $CACHE_NAME_FILTER"
-
-	mapfile -t entries < <(_cache_list_rows "$repo")
+	mapfile -t entries < <(gh_cache_list "$repo" "$PAGE_LIMIT")
 
 	if [[ ${#entries[@]} -eq 0 ]]; then
 		_idle "No caches"
@@ -750,11 +572,7 @@ cmd_cache_list_one() {
 		key="${rest#*$'\t'}"
 		[[ -z "$id" ]] && continue
 		[[ "$size" =~ ^[0-9]+$ ]] || size=0
-
-		if ! _cache_key_matches "$key"; then
-			continue
-		fi
-
+		gh_key_matches "$key" "$CACHE_NAME_FILTER" || continue
 		count=$((count + 1))
 		bytes=$((bytes + size))
 	done
@@ -782,61 +600,34 @@ cmd_cache_delete_one() {
 			warn "Reached MAX_PAGES=$MAX_PAGES — stopping this repo"
 			break
 		fi
-
-		mapfile -t entries < <(
-			gh cache list -R "$repo" --limit "$PAGE_LIMIT" \
-				--json id,key \
-				--jq '.[] | "\(.id)\t\(.key)"' \
-				2>/dev/null || true
-		)
+		mapfile -t entries < <(gh_cache_list_ids "$repo" "$PAGE_LIMIT")
 		batch=${#entries[@]}
 		if [[ "$batch" -eq 0 ]]; then
-			if [[ "$page" -eq 1 ]]; then
-				_idle "No caches"
-			else
-				_idle "No more caches"
-			fi
+			[[ "$page" -eq 1 ]] && _idle "No caches" || _idle "No more caches"
 			break
 		fi
-
 		info "Page" "$page ($batch cache(s))"
 		matched_this_page=0
-
 		for entry in "${entries[@]}"; do
 			id="${entry%%$'\t'*}"
 			key="${entry#*$'\t'}"
 			[[ -z "$id" ]] && continue
-
-			if ! _cache_key_matches "$key"; then
-				continue
-			fi
-
+			gh_key_matches "$key" "$CACHE_NAME_FILTER" || continue
 			matched_this_page=$((matched_this_page + 1))
-
 			if [[ "$DRY_RUN" == "1" ]]; then
 				log "  [dry-run] would delete id=$id key=$key"
 				deleted=$((deleted + 1))
 				continue
 			fi
 			log "  delete id=$id key=$key"
-			if gh cache delete "$id" -R "$repo" 2>/dev/null; then
+			if gh_cache_delete "$repo" "$id"; then
 				deleted=$((deleted + 1))
 			else
 				warn "delete failed for id=$id"
 			fi
 		done
-
-		# With a name filter: stop when a page has no matches (avoids infinite loop
-		# while non-matching caches still exist on the API side).
-		if [[ -n "$CACHE_NAME_FILTER" && "$matched_this_page" -eq 0 ]]; then
-			break
-		fi
-
-		# Without a filter: last real page is smaller than PAGE_LIMIT.
-		if [[ -z "$CACHE_NAME_FILTER" && "$batch" -lt "$PAGE_LIMIT" ]]; then
-			break
-		fi
-
+		[[ -n "$CACHE_NAME_FILTER" && "$matched_this_page" -eq 0 ]] && break
+		[[ -z "$CACHE_NAME_FILTER" && "$batch" -lt "$PAGE_LIMIT" ]] && break
 		[[ "$DRY_RUN" == "1" ]] && break
 	done
 
@@ -848,8 +639,7 @@ cmd_cache_delete_one() {
 cmd_cache() {
 	local sub="${1:-}"
 	shift || true
-	local target="" arg
-
+	local target=""
 	CACHE_NAME_FILTER=""
 
 	while [[ $# -gt 0 ]]; do
@@ -877,84 +667,34 @@ cmd_cache() {
 	done
 
 	case "$sub" in
-		show)
-			foreach_repo cmd_cache_show_one "$target"
-			print_summary_sized "caches listed" "$__walk_total" "$__walk_bytes"
-			;;
-		list)
-			foreach_repo cmd_cache_list_one "$target"
-			print_summary_sized "caches" "$__walk_total" "$__walk_bytes"
-			;;
-		delete)
-			foreach_repo cmd_cache_delete_one "$target"
-			print_summary "caches deleted" "$__walk_total"
-			;;
-		*)
-			usage_error "Missing or unknown cache subcommand" \
-				"cache show|list|delete [dir-spec] [--name <pattern>]"
-			;;
+		show)   foreach_repo cmd_cache_show_one "$target"; print_summary_sized "caches listed" "$__walk_total" "$__walk_bytes" ;;
+		list)   foreach_repo cmd_cache_list_one "$target"; print_summary_sized "caches" "$__walk_total" "$__walk_bytes" ;;
+		delete) foreach_repo cmd_cache_delete_one "$target"; print_summary "caches deleted" "$__walk_total" ;;
+		*) usage_error "Missing or unknown cache subcommand" \
+			"cache show|list|delete [dir-spec] [--name <pattern>]" ;;
 	esac
 }
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # CI
-# -----------------------------------------------------------------------------
-
-_list_runs_for_start() {
-	local repo="$1" branch="$2" sha="$3"
-	local out=""
-
-	out="$(
-		gh run list -R "$repo" --commit "$sha" --limit "$PAGE_LIMIT" \
-			--json databaseId,status,conclusion,headSha,displayTitle,workflowName \
-			--jq '.[] | "\(.databaseId)\t\(.status)\t\(.conclusion // "-")\t\(.headSha // "")\t\(.workflowName // "-")\t\(.displayTitle // "")"' \
-			2>/dev/null || true
-	)"
-	if [[ -n "$out" ]]; then
-		printf '%s\n' "$out"
-		return 0
-	fi
-
-	gh run list -R "$repo" --branch "$branch" --limit "$PAGE_LIMIT" \
-		--json databaseId,status,conclusion,headSha,displayTitle,workflowName \
-		--jq '.[] | "\(.databaseId)\t\(.status)\t\(.conclusion // "-")\t\(.headSha // "")\t\(.workflowName // "-")\t\(.displayTitle // "")"' \
-		2>/dev/null || true
-}
+# =============================================================================
 
 cmd_ci_stop_one() {
 	local dir="$1" repo="$2"
-	local branch cancelled=0
-	local id status workflow title entry rest st
+	local branch cancelled=0 id status workflow title entry rest
 	local -a entries=()
-	local -A seen_id=()
 
 	LAST_COUNT=0
 	info "Remote" "$repo"
-
 	branch="$(git_current_branch "$dir")"
 	[[ -z "$branch" ]] && { err "Cannot resolve current branch"; return 1; }
 	info "Branch" "$branch"
 
-	for st in in_progress queued pending waiting requested; do
-		while IFS= read -r entry; do
-			[[ -z "$entry" ]] && continue
-			id="${entry%%$'\t'*}"
-			[[ -z "$id" || -n "${seen_id[$id]+x}" ]] && continue
-			seen_id["$id"]=1
-			entries+=("$entry")
-		done < <(
-			gh run list -R "$repo" --branch "$branch" --status "$st" --limit "$PAGE_LIMIT" \
-				--json databaseId,status,displayTitle,workflowName \
-				--jq '.[] | "\(.databaseId)\t\(.status)\t\(.workflowName // "-")\t\(.displayTitle // "")"' \
-				2>/dev/null || true
-		)
-	done
-
+	mapfile -t entries < <(gh_run_list_active "$repo" "$branch" "$PAGE_LIMIT")
 	if [[ ${#entries[@]} -eq 0 ]]; then
 		_idle "No active runs on $branch"
 		return 0
 	fi
-
 	info "Found" "${#entries[@]} unique active run(s)"
 
 	for entry in "${entries[@]}"; do
@@ -964,20 +704,18 @@ cmd_ci_stop_one() {
 		rest="${rest#*$'\t'}"
 		workflow="${rest%%$'\t'*}"
 		title="${rest#*$'\t'}"
-
 		if [[ "$DRY_RUN" == "1" ]]; then
 			log "  [dry-run] would cancel: $workflow id=$id"
 			cancelled=$((cancelled + 1))
 			continue
 		fi
 		log "  cancel: $workflow id=$id"
-		if gh run cancel "$id" -R "$repo" 2>/dev/null; then
+		if gh_run_cancel "$repo" "$id"; then
 			cancelled=$((cancelled + 1))
 		else
 			warn "cancel failed for id=$id"
 		fi
 	done
-
 	LAST_COUNT=$cancelled
 	ok "Cancelled $cancelled unique workflow run(s)"
 }
@@ -991,17 +729,14 @@ cmd_ci_start_one() {
 
 	LAST_COUNT=0
 	info "Remote" "$repo"
-
 	branch="$(git_current_branch "$dir")"
 	sha="$(git_head_sha_full "$dir")"
 	[[ -z "$branch" || -z "$sha" ]] && { err "Cannot resolve branch/HEAD"; return 1; }
-
 	info "Branch" "$branch"
 	info "HEAD" "$sha"
 	[[ "$ONLY_FAILED" == "1" ]] && info "Filter" "--failed"
 
-	mapfile -t entries < <(_list_runs_for_start "$repo" "$branch" "$sha")
-
+	mapfile -t entries < <(gh_run_list_for_start "$repo" "$branch" "$sha" "$PAGE_LIMIT")
 	if [[ ${#entries[@]} -eq 0 ]]; then
 		warn "No workflow runs found"
 		ok "No workflows re-run"
@@ -1020,12 +755,9 @@ cmd_ci_start_one() {
 		workflow="${rest%%$'\t'*}"
 		title="${rest#*$'\t'}"
 		[[ -z "$id" ]] && continue
-
 		[[ -n "$workflow" && -n "${seen_workflow[$workflow]+x}" ]] && continue
 		[[ -n "$workflow" ]] && seen_workflow["$workflow"]=1
-
 		[[ "$RUN_LIMIT" -gt 0 && "$rerun" -ge "$RUN_LIMIT" ]] && break
-
 		case "$status" in
 			in_progress|queued|pending|waiting|requested)
 				log "  skip (already active): $workflow"
@@ -1033,28 +765,22 @@ cmd_ci_start_one() {
 				continue
 				;;
 		esac
-
-		if [[ "$ONLY_FAILED" == "1" ]]; then
-			case "$conclusion" in
-				failure|cancelled|timed_out|startup_failure) ;;
-				*) skipped=$((skipped + 1)); continue ;;
-			esac
+		if [[ "$ONLY_FAILED" == "1" ]] && ! gh_run_is_failed "$conclusion"; then
+			skipped=$((skipped + 1))
+			continue
 		fi
-
 		if [[ "$DRY_RUN" == "1" ]]; then
 			log "  [dry-run] Re-run: $workflow id=$id"
 			rerun=$((rerun + 1))
 			continue
 		fi
-
 		log "  Re-run: $workflow id=$id"
-		if gh run rerun "$id" -R "$repo" 2>/dev/null; then
+		if gh_run_rerun "$repo" "$id"; then
 			rerun=$((rerun + 1))
 		else
 			warn "rerun failed for id=$id"
 		fi
 	done
-
 	LAST_COUNT=$rerun
 	ok "Re-run $rerun workflow(s) (skipped=$skipped)"
 }
@@ -1066,31 +792,20 @@ cmd_ci_restart_one() {
 }
 
 cmd_ci_status_one() {
-	local dir="$1" repo="$2"
-	local branch
-	local -a entries=()
+	local dir="$1" repo="$2" branch
 	local id status conclusion workflow title entry rest
+	local -a entries=()
 
 	LAST_COUNT=0
 	info "Remote" "$repo"
-
 	branch="$(git_current_branch "$dir")"
 	[[ -z "$branch" ]] && { err "Cannot resolve current branch"; return 1; }
 	info "Branch" "$branch"
-
-	mapfile -t entries < <(
-		gh run list -R "$repo" --branch "$branch" --limit 15 \
-			--json databaseId,status,conclusion,displayTitle,workflowName \
-			--jq '.[] | "\(.databaseId)\t\(.status)\t\(.conclusion // "-")\t\(.workflowName // "-")\t\(.displayTitle // "")"' \
-			2>/dev/null || true
-	)
-
+	mapfile -t entries < <(gh_run_list_recent "$repo" "$branch" 15)
 	if [[ ${#entries[@]} -eq 0 ]]; then
 		_idle "No recent runs"
 		return 0
 	fi
-
-	printf "  ${_CLR_DIM}%-12s  %-12s  %-20s  %s${_CLR_RESET}\n" "STATUS" "CONCLUSION" "WORKFLOW" "TITLE"
 	for entry in "${entries[@]}"; do
 		id="${entry%%$'\t'*}"
 		rest="${entry#*$'\t'}"
@@ -1100,7 +815,8 @@ cmd_ci_status_one() {
 		rest="${rest#*$'\t'}"
 		workflow="${rest%%$'\t'*}"
 		title="${rest#*$'\t'}"
-		printf "  %-12s  %-12s  %-20s  %s\n" "$(_clr_ci_status "$status")" "$(_clr_ci_conclusion "$conclusion")" "$workflow" "$title"
+		printf "  %-12s  %-12s  %-20s  %s\n" \
+			"$(_clr_ci_status "$status")" "$(_clr_ci_conclusion "$conclusion")" "$workflow" "$title"
 		LAST_COUNT=$((LAST_COUNT + 1))
 	done
 	ok "Listed recent runs"
@@ -1110,59 +826,36 @@ cmd_ci() {
 	local sub="${1:-}"
 	shift || true
 	local target="" arg
-
 	for arg in "$@"; do
 		case "$arg" in
 			--failed) ONLY_FAILED=1 ;;
 			*) [[ -z "$target" ]] && target="$arg" ;;
 		esac
 	done
-
 	case "$sub" in
-		stop)
-			foreach_repo cmd_ci_stop_one "$target"
-			print_summary "runs cancelled" "$__walk_total"
-			;;
-		start)
-			foreach_repo cmd_ci_start_one "$target"
-			print_summary "workflows re-run" "$__walk_total"
-			;;
-		restart)
-			foreach_repo cmd_ci_restart_one "$target"
-			print_summary "workflows re-run" "$__walk_total"
-			;;
-		status)
-			foreach_repo cmd_ci_status_one "$target"
-			print_summary "repos checked" "$__walk_repos"
-			;;
-		*)
-			usage_error "Missing or unknown ci subcommand" "ci stop|start|restart|status [dir-spec] [--failed]"
-			;;
+		stop)     foreach_repo cmd_ci_stop_one "$target"; print_summary "runs cancelled" "$__walk_total" ;;
+		start)    foreach_repo cmd_ci_start_one "$target"; print_summary "workflows re-run" "$__walk_total" ;;
+		restart)  foreach_repo cmd_ci_restart_one "$target"; print_summary "workflows re-run" "$__walk_total" ;;
+		status)   foreach_repo cmd_ci_status_one "$target"; print_summary "repos checked" "$__walk_repos" ;;
+		*) usage_error "Missing or unknown ci subcommand" "ci stop|start|restart|status [dir-spec] [--failed]" ;;
 	esac
 }
 
-# -----------------------------------------------------------------------------
-# Submodule dependency helpers
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Submodule update order
+# =============================================================================
 
-canonical_repo_id() {
-	git_canonical_repo_id "$1"
-}
+canonical_repo_id() { git_canonical_repo_id "$1"; }
 
 urls_from_gitmodules_file() {
 	local file="$1"
 	[[ -f "$file" ]] || return 0
-	git config --file "$file" --list 2>/dev/null \
-		| sed -n 's/^submodule\..*\.url=//p' \
-		|| true
+	git config --file "$file" --list 2>/dev/null | sed -n 's/^submodule\..*\.url=//p' || true
 }
 
 collect_dep_ids_from() {
-	local dir="$1"
-	local file url id
-
+	local dir="$1" file url id
 	[[ -d "$dir" ]] || return 0
-
 	while IFS= read -r -d '' file; do
 		while IFS= read -r url; do
 			[[ -z "$url" ]] && continue
@@ -1181,15 +874,9 @@ build_update_order() {
 	shopt -s nullglob
 	for dir in "$ROOT"/*/; do
 		dir="${dir%/}"
-		if [[ ! -d "$dir/.git" && ! -f "$dir/.git" ]]; then
-			continue
-		fi
-		if ! repo_disp="$(git_resolve_repo "$dir" "$OWNER" 2>/dev/null)"; then
-			continue
-		fi
-		if ! id="$(git_canonical_repo_id "https://github.com/${repo_disp}.git")"; then
-			continue
-		fi
+		[[ -d "$dir/.git" || -f "$dir/.git" ]] || continue
+		repo_disp="$(git_resolve_repo "$dir" "$OWNER" 2>/dev/null)" || continue
+		id="$(git_canonical_repo_id "https://github.com/${repo_disp}.git")" || continue
 		name="$(basename "$dir")"
 		if [[ -n "${id_to_folder[$id]+x}" ]]; then
 			warn "Duplicate clone of $id — keeping first"
@@ -1199,7 +886,6 @@ build_update_order() {
 		nodes+=("$id")
 		deps["$id"]=""
 	done
-
 	[[ ${#nodes[@]} -eq 0 ]] && return 0
 
 	for id in "${nodes[@]}"; do
@@ -1217,15 +903,10 @@ build_update_order() {
 
 	local -a ordered_ids
 	mapfile -t ordered_ids < <(topological_sort nodes deps)
-
 	for id in "${ordered_ids[@]}"; do
 		printf '%s\n' "${id_to_folder[$id]}"
 	done
 }
-
-# -----------------------------------------------------------------------------
-# submodules
-# -----------------------------------------------------------------------------
 
 run_q() {
 	local out rc
@@ -1243,21 +924,18 @@ run_q() {
 }
 
 cmd_submodules_init_one() {
-	local dir="$1" repo="$2"
-
+	local dir="$1"
 	info "Path" "$dir"
 	if [[ ! -f "$dir/.gitmodules" ]]; then
 		_idle "No .gitmodules — nothing to init"
 		LAST_COUNT=0
 		return 0
 	fi
-
 	if [[ "$DRY_RUN" == "1" ]]; then
 		log "  [dry-run] would: git submodule update --init --recursive"
 		LAST_COUNT=1
 		return 0
 	fi
-
 	if git -C "$dir" submodule update --init --recursive; then
 		ok "Submodules initialized"
 		LAST_COUNT=1
@@ -1268,21 +946,18 @@ cmd_submodules_init_one() {
 }
 
 cmd_submodules_deinit_one() {
-	local dir="$1" repo="$2"
-
+	local dir="$1"
 	info "Path" "$dir"
 	if [[ ! -f "$dir/.gitmodules" ]]; then
 		_idle "No .gitmodules — nothing to deinit"
 		LAST_COUNT=0
 		return 0
 	fi
-
 	if [[ "$DRY_RUN" == "1" ]]; then
 		log "  [dry-run] would: git submodule deinit --all -f"
 		LAST_COUNT=1
 		return 0
 	fi
-
 	if git -C "$dir" submodule deinit --all -f; then
 		ok "Submodules deinitialized"
 		LAST_COUNT=1
@@ -1293,23 +968,18 @@ cmd_submodules_deinit_one() {
 }
 
 commit_submodules_if_needed() {
-	local dir="$1"
-	local name
+	local dir="$1" name
 	name="$(basename "$dir")"
-
 	if ! git_is_dirty "$dir"; then
 		_idle "No changes"
 		return 1
 	fi
-
 	log "  Changes detected:"
 	git -C "$dir" status --short | sed 's/^/    /'
-
 	if [[ "$DRY_RUN" == "1" ]]; then
 		log "  [dry-run] would commit (no push)"
 		return 0
 	fi
-
 	run_q git -C "$dir" add -A
 	if git -C "$dir" diff --cached --quiet; then
 		warn "Dirty worktree but nothing staged; skipping commit"
@@ -1321,19 +991,16 @@ commit_submodules_if_needed() {
 		return 1
 	fi
 	ok "Commit $(git_head_sha "$dir") (not pushed)"
-	return 0
 }
 
 cmd_submodules_update_one() {
 	local dir="$1" repo="$2"
-	local stashed=0
-	local sm_name sm_path sm_url abs
+	local stashed=0 sm_name sm_path sm_url abs
 	local action kind current planned target sha sha_new
-	local n_upd=0 n_re=0 n_unres=0 n_err=0
+	local n_upd=0 n_re=0 n_unres=0 n_err=0 i
 	local -a plan_name=() plan_path=() plan_cur=() plan_new=()
 	local -a plan_action=() plan_kind=() plan_target=()
 	local -a shadow_repos=()
-	local i
 
 	_sm_shadow_cleanup() {
 		local r
@@ -1363,7 +1030,6 @@ cmd_submodules_update_one() {
 	while IFS=$'\t' read -r sm_name sm_path sm_url; do
 		[[ -z "$sm_name" || -z "$sm_path" ]] && continue
 		abs="$dir/$sm_path"
-
 		if [[ "$DRY_RUN" != "1" ]]; then
 			if ! git -C "$dir" submodule update --init -- "$sm_path" >/dev/null 2>&1; then
 				warn "init failed for $sm_path"
@@ -1374,7 +1040,6 @@ cmd_submodules_update_one() {
 			warn "missing work tree for $sm_path"
 			continue
 		fi
-
 		shadow_repos+=("$abs")
 		git_shadow_fetch "$abs" || warn "shadow fetch failed for $sm_path"
 		git -C "$abs" fetch origin --tags --force --prune >/dev/null 2>&1 || true
@@ -1382,14 +1047,12 @@ cmd_submodules_update_one() {
 
 		IFS=$'\t' read -r action kind current planned target sha \
 			< <(git_sm_plan "$dir" "$sm_name" "$abs")
-
 		case "$action" in
 			update)    n_upd=$((n_upd + 1)) ;;
 			rerelease) n_re=$((n_re + 1)) ;;
 			skip)      n_unres=$((n_unres + 1)) ;;
 			error)     n_err=$((n_err + 1)) ;;
 		esac
-
 		plan_name+=("$sm_name")
 		plan_path+=("$sm_path")
 		plan_cur+=("$current")
@@ -1403,7 +1066,6 @@ cmd_submodules_update_one() {
 	for i in "${!plan_name[@]}"; do
 		print_columns "${plan_name[$i]}" "${plan_cur[$i]}" "$(_clr_planned "${plan_new[$i]}")"
 	done
-
 	info "Plan" "${n_upd} update(s), ${n_re} re-release(s), ${n_unres} unresolved, ${n_err} error(s)"
 	[[ "${SM_CONFIRM:-0}" == "1" ]] && info "Mode" "--confirm"
 
@@ -1434,7 +1096,6 @@ cmd_submodules_update_one() {
 			err "${plan_name[$i]}: ${plan_new[$i]}"
 			continue
 		fi
-
 		if [[ "$kind" == "branch" ]]; then
 			git_sm_checkout_branch "$abs" "$target" \
 				|| { warn "checkout origin/${target} failed for ${plan_name[$i]}"; continue; }
@@ -1442,7 +1103,6 @@ cmd_submodules_update_one() {
 			git_sm_checkout_tag "$abs" "$target" \
 				|| { warn "checkout ${target} failed for ${plan_name[$i]}"; continue; }
 		fi
-
 		sha_new="$(git -C "$abs" rev-parse HEAD)"
 		if ! git_sm_stage_gitlink "$dir" "${plan_path[$i]}" "$sha_new"; then
 			err "gitlink not staged for ${plan_name[$i]}"
@@ -1463,9 +1123,7 @@ cmd_submodules_update_one() {
 	else
 		LAST_COUNT=0
 	fi
-
 	_sm_shadow_cleanup
-
 	if [[ "$stashed" -eq 1 ]]; then
 		log "  Restoring parent stash..."
 		if git_stash_pop_safe "$dir"; then
@@ -1477,247 +1135,139 @@ cmd_submodules_update_one() {
 	fi
 }
 
-_sb_resolve_single_repo_dir() {
-	resolve_dir_under "$ROOT" "$1"
-}
-
 cmd_submodules_list_one() {
-	local dir="$1" repo="$2"
-	local name path url count=0
-
+	local dir="$1" repo="$2" name path url count=0
 	info "Path" "$dir"
 	info "Remote" "$repo"
-
 	if ! git_has_submodules "$dir"; then
 		info "Submodules" "none"
 		LAST_COUNT=0
 		return 0
 	fi
-
 	printf "  ${_CLR_DIM}%-36s  %-40s  %s${_CLR_RESET}\n" "NAME" "PATH" "URL"
 	while IFS=$'\t' read -r name path url; do
 		[[ -z "$name" ]] && continue
 		printf "  %-36s  %-40s  %s\n" "$name" "$path" "$url"
 		count=$((count + 1))
 	done < <(git_gitmodules_list "$dir")
-
 	info "Count" "$count"
 	ok "Listed $count submodule(s)"
 	LAST_COUNT=$count
 }
 
 cmd_submodules_add() {
-	local name="" dir="" url="" path=""
+	local name="" dir url path repo
 	local -a pos=()
-	local repo
-
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
-			--name)
-				shift
-				[[ $# -gt 0 ]] || usage_error "--name requires a value" \
-					"submodules add <dir> <URL> <path> --name <name>"
-				name="$1"
-				shift
-				;;
-			--name=*)
-				name="${1#--name=}"
-				shift
-				;;
-			-*)
-				usage_error "Unknown option: $1" \
-					"submodules add <dir> <URL> <path> --name <name>"
-				;;
-			*)
-				pos+=("$1")
-				shift
-				;;
+			--name) shift; [[ $# -gt 0 ]] || usage_error "--name requires a value" "submodules add <dir> <URL> <path> --name <name>"; name="$1"; shift ;;
+			--name=*) name="${1#--name=}"; shift ;;
+			-*) usage_error "Unknown option: $1" "submodules add <dir> <URL> <path> --name <name>" ;;
+			*) pos+=("$1"); shift ;;
 		esac
 	done
-
-	[[ -n "$name" ]] || usage_error "Missing required --name" \
+	[[ -n "$name" ]] || usage_error "Missing required --name" "submodules add <dir> <URL> <path> --name <name>"
+	[[ ${#pos[@]} -eq 3 ]] || usage_error "Expected <dir> <URL> <path> (got ${#pos[@]} positional args)" \
 		"submodules add <dir> <URL> <path> --name <name>"
-
-	if [[ ${#pos[@]} -ne 3 ]]; then
-		usage_error "Expected <dir> <URL> <path> (got ${#pos[@]} positional args)" \
-			"submodules add <dir> <URL> <path> --name <name>"
-	fi
-
-	dir="$(_sb_resolve_single_repo_dir "${pos[0]}")"
+	dir="$(resolve_dir_under "$ROOT" "${pos[0]}")"
 	url="${pos[1]}"
 	path="${pos[2]}"
-
-	repo="$(git_resolve_repo "$dir" "$OWNER")" \
-		|| displayError "Target must be a ${OWNER} git repository: $dir"
-
-	if ! git_submodule_path_is_safe "$path"; then
-		displayError "Invalid path '$path' (must be relative to the repo and must not contain '..')"
-	fi
-
+	repo="$(git_resolve_repo "$dir" "$OWNER")" || displayError "Target must be a ${OWNER} git repository: $dir"
+	git_submodule_path_is_safe "$path" || displayError "Invalid path '$path' (must be relative to the repo and must not contain '..')"
 	section "$(basename "$dir")"
 	info "Path" "$dir"
 	info "Remote" "$repo"
-	info "Name" "$name"
+	info "Add" "$name → $path"
 	info "URL" "$url"
-	info "Submodule path" "$path"
-
 	if [[ "$DRY_RUN" == "1" ]]; then
-		log "  [dry-run] would: git -C \"$dir\" submodule add --name \"$name\" \"$url\" \"$path\""
-		log "  [dry-run] (no init / no update)"
+		log "  [dry-run] would: git submodule add --name $name $url $path"
 		return 0
 	fi
-
 	if git -C "$dir" submodule add --name "$name" "$url" "$path"; then
-		ok "Submodule added (not initialized)"
+		ok "Submodule added (not committed)"
 	else
 		displayError "git submodule add failed"
 	fi
 }
 
 cmd_submodules_delete() {
-	local name_sel="" url_sel="" path_sel="" dir=""
+	local dir repo name_sel="" url_sel="" path_sel="" selectors=0 name path url
 	local -a pos=()
-	local repo line sm_name sm_path sm_url abs_path selectors=0
-
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
-			--name)
-				shift
-				[[ $# -gt 0 ]] || usage_error "--name requires a value" \
-					"submodules delete <dir> (--name <name> | --url <url> | --path <path>)"
-				name_sel="$1"
-				shift
-				;;
-			--name=*)
-				name_sel="${1#--name=}"
-				shift
-				;;
-			--url)
-				shift
-				[[ $# -gt 0 ]] || usage_error "--url requires a value" \
-					"submodules delete <dir> (--name <name> | --url <url> | --path <path>)"
-				url_sel="$1"
-				shift
-				;;
-			--url=*)
-				url_sel="${1#--url=}"
-				shift
-				;;
-			--path)
-				shift
-				[[ $# -gt 0 ]] || usage_error "--path requires a value" \
-					"submodules delete <dir> (--name <name> | --url <url> | --path <path>)"
-				path_sel="$1"
-				shift
-				;;
-			--path=*)
-				path_sel="${1#--path=}"
-				shift
-				;;
-			-*)
-				usage_error "Unknown option: $1" \
-					"submodules delete <dir> (--name <name> | --url <url> | --path <path>)"
-				;;
-			*)
-				pos+=("$1")
-				shift
-				;;
+			--name) shift; name_sel="${1:-}"; shift || true ;;
+			--name=*) name_sel="${1#--name=}"; shift ;;
+			--url)  shift; url_sel="${1:-}"; shift || true ;;
+			--url=*) url_sel="${1#--url=}"; shift ;;
+			--path) shift; path_sel="${1:-}"; shift || true ;;
+			--path=*) path_sel="${1#--path=}"; shift ;;
+			-*) usage_error "Unknown option: $1" \
+				"submodules delete <dir> (--name <name> | --url <url> | --path <path>)" ;;
+			*) pos+=("$1"); shift ;;
 		esac
 	done
-
 	[[ ${#pos[@]} -eq 1 ]] || usage_error "Expected exactly one <dir> (got ${#pos[@]})" \
 		"submodules delete <dir> (--name <name> | --url <url> | --path <path>)"
-
-	dir="$(_sb_resolve_single_repo_dir "${pos[0]}")"
-	repo="$(git_resolve_repo "$dir" "$OWNER")" \
-		|| displayError "Target must be a ${OWNER} git repository: $dir"
-
+	dir="$(resolve_dir_under "$ROOT" "${pos[0]}")"
+	repo="$(git_resolve_repo "$dir" "$OWNER")" || displayError "Target must be a ${OWNER} git repository: $dir"
 	[[ -n "$name_sel" ]] && selectors=$((selectors + 1))
 	[[ -n "$url_sel"  ]] && selectors=$((selectors + 1))
 	[[ -n "$path_sel" ]] && selectors=$((selectors + 1))
-
-	if [[ "$selectors" -ne 1 ]]; then
-		usage_error "Exactly one of --name, --url or --path is required" \
-			"submodules delete <dir> (--name <name> | --url <url> | --path <path>)"
-	fi
-
-	if [[ -n "$path_sel" ]] && ! git_submodule_path_is_safe "$path_sel"; then
-		displayError "Invalid --path '$path_sel' (must be relative to the repo and must not contain '..')"
-	fi
+	[[ "$selectors" -eq 1 ]] || usage_error "Exactly one of --name, --url or --path is required" \
+		"submodules delete <dir> (--name <name> | --url <url> | --path <path>)"
 
 	if [[ -n "$name_sel" ]]; then
-		line="$(git_gitmodules_find_by_name "$dir" "$name_sel")" \
-			|| displayError "No submodule named '$name_sel' in $dir"
+		IFS=$'\t' read -r name path url < <(git_gitmodules_find_by_name "$dir" "$name_sel") \
+			|| displayError "No submodule named '$name_sel'"
 	elif [[ -n "$url_sel" ]]; then
-		line="$(git_gitmodules_find_by_url "$dir" "$url_sel")" \
-			|| displayError "No submodule with URL '$url_sel' in $dir"
+		IFS=$'\t' read -r name path url < <(git_gitmodules_find_by_url "$dir" "$url_sel") \
+			|| displayError "No submodule with URL '$url_sel'"
 	else
-		line="$(git_gitmodules_find_by_path "$dir" "$path_sel")" \
-			|| displayError "No submodule with path '$path_sel' in $dir"
+		IFS=$'\t' read -r name path url < <(git_gitmodules_find_by_path "$dir" "$path_sel") \
+			|| displayError "No submodule at path '$path_sel'"
 	fi
-
-	IFS=$'\t' read -r sm_name sm_path sm_url <<<"$line"
 
 	section "$(basename "$dir")"
 	info "Path" "$dir"
 	info "Remote" "$repo"
-	info "Name" "$sm_name"
-	info "Submodule path" "$sm_path"
-	info "URL" "$sm_url"
-
-	abs_path="$dir/$sm_path"
-
+	info "Delete" "$name ($path)"
 	if [[ "$DRY_RUN" == "1" ]]; then
-		log "  [dry-run] would deinit/remove submodule '$sm_name' at $sm_path"
-		log "  [dry-run] would delete folder: $abs_path"
-		log "  [dry-run] no commit, no push"
+		log "  [dry-run] would deinit/remove $name and delete $path"
 		return 0
 	fi
-
-	git -C "$dir" submodule deinit -f -- "$sm_path" 2>/dev/null || true
-	git -C "$dir" rm -f -- "$sm_path" 2>/dev/null || true
-	git -C "$dir" config -f .gitmodules --remove-section "submodule.$sm_name" 2>/dev/null || true
-	if [[ -f "$dir/.gitmodules" ]] && ! git_has_submodules "$dir"; then
-		git -C "$dir" rm -f -- .gitmodules 2>/dev/null || rm -f "$dir/.gitmodules"
-	else
-		git -C "$dir" add .gitmodules 2>/dev/null || true
-	fi
-	rm -rf "$dir/.git/modules/$sm_path" 2>/dev/null || true
-	rm -rf "$abs_path" 2>/dev/null || true
-
-	ok "Submodule removed (folder deleted; no commit, no push)"
+	git -C "$dir" submodule deinit -f -- "$path" >/dev/null 2>&1 || true
+	git -C "$dir" rm -f -- "$path" >/dev/null 2>&1 || true
+	rm -rf "$dir/$path" "$dir/.git/modules/$name" 2>/dev/null || true
+	ok "Submodule removed (not committed)"
 }
 
 cmd_submodules() {
 	local sub="${1:-}"
 	shift || true
-	local target=""
-	local name dir repo arg
+	local target="" name dir repo arg
 	local -a ordered=() rest=()
 
-	if [[ -z "$sub" ]]; then
-		usage_error "Missing submodules subcommand" \
-			"submodules init|deinit|update|list [dir-spec] [--confirm] | add … | delete …"
-	fi
+	[[ -n "$sub" ]] || usage_error "Missing submodules subcommand" \
+		"submodules init|deinit|update|list [dir-spec] [--confirm] | add … | delete …"
 
 	SM_CONFIRM=0
+	case "$sub" in
+		add)    cmd_submodules_add "$@"; return ;;
+		delete) cmd_submodules_delete "$@"; return ;;
+	esac
+
 	for arg in "$@"; do
 		case "$arg" in
 			--confirm) SM_CONFIRM=1 ;;
-			*) rest+=("$arg") ;;
+			-*) usage_error "Unknown option: $arg" "submodules ${sub} [dir-spec] [--confirm]" ;;
+			*) [[ -z "$target" ]] && target="$arg" ;;
 		esac
 	done
-	target="${rest[0]:-}"
 
 	case "$sub" in
-		init)
-			foreach_repo cmd_submodules_init_one "$target"
-			print_summary "repos initialized" "$__walk_total"
-			;;
-		deinit)
-			foreach_repo cmd_submodules_deinit_one "$target"
-			print_summary "repos deinitialized" "$__walk_total"
-			;;
+		init)   foreach_repo cmd_submodules_init_one "$target"; print_summary "repos initialized" "$__walk_total" ;;
+		deinit) foreach_repo cmd_submodules_deinit_one "$target"; print_summary "repos deinitialized" "$__walk_total" ;;
+		list)   foreach_repo cmd_submodules_list_one "$target"; print_summary "submodules listed" "$__walk_total" ;;
 		update)
 			if [[ -n "$target" ]]; then
 				foreach_repo cmd_submodules_update_one "$target"
@@ -1731,7 +1281,6 @@ cmd_submodules() {
 					print_summary "repos updated" 0
 					return 0
 				fi
-				info "Update order" "$(IFS=','; echo "${ordered[*]}")"
 				__walk_repos=0
 				__walk_total=0
 				for name in "${ordered[@]}"; do
@@ -1749,33 +1298,20 @@ cmd_submodules() {
 				print_summary "repos updated" "$__walk_total"
 			fi
 			;;
-		list)
-			foreach_repo cmd_submodules_list_one "$target"
-			print_summary "submodules listed" "$__walk_total"
-			;;
-		add)
-			cmd_submodules_add "$@"
-			;;
-		delete)
-			cmd_submodules_delete "$@"
-			;;
-		*)
-			usage_error "Unknown submodules subcommand: $sub" \
-				"submodules init|deinit|update|list [dir-spec] [--confirm] | add … | delete …"
-			;;
+		*) usage_error "Unknown submodules subcommand: $sub" \
+			"submodules init|deinit|update|list [dir-spec] [--confirm] | add … | delete …" ;;
 	esac
 }
 
-# -----------------------------------------------------------------------------
-# git (reset | pull | sync)
-# -----------------------------------------------------------------------------
+# =============================================================================
+# git
+# =============================================================================
 
 cmd_git_reset_one() {
 	local dir="$1"
 	info "Path" "$dir"
 	if [[ "$DRY_RUN" == "1" ]]; then
 		log "  [dry-run] would: git reset --hard && git clean -fd"
-		log "  [dry-run] would: submodule foreach reset --hard && submodule update --init"
 		LAST_COUNT=1
 		return 0
 	fi
@@ -1798,8 +1334,7 @@ cmd_git_pull_one() {
 		LAST_COUNT=1
 		return 0
 	fi
-	if git -C "$dir" fetch origin \
-		&& git -C "$dir" pull --rebase --no-recurse-submodules; then
+	if git -C "$dir" fetch origin && git -C "$dir" pull --rebase --no-recurse-submodules; then
 		git -C "$dir" submodule update --init --recursive >/dev/null 2>&1 || true
 		ok "Pull complete ($(git_head_sha "$dir"))"
 		LAST_COUNT=1
@@ -1809,82 +1344,56 @@ cmd_git_pull_one() {
 	fi
 }
 
-cmd_git_sync_one() {
-	cmd_git_pull_one "$@"
-}
+cmd_git_sync_one() { cmd_git_pull_one "$@"; }
 
 cmd_git() {
-	local sub="${1:-}"
-	local target="${2:-}"
-
+	local sub="${1:-}" target="${2:-}"
 	case "$sub" in
-		reset)
-			foreach_repo cmd_git_reset_one "$target"
-			print_summary "repos reset" "$__walk_total"
-			;;
-		pull)
-			foreach_repo cmd_git_pull_one "$target"
-			print_summary "repos pulled" "$__walk_total"
-			;;
-		sync)
-			foreach_repo cmd_git_sync_one "$target"
-			print_summary "repos synced" "$__walk_total"
-			;;
-		*)
-			usage_error "Missing or unknown git subcommand" "git reset|pull|sync [dir-spec]"
-			;;
+		reset) foreach_repo cmd_git_reset_one "$target"; print_summary "repos reset" "$__walk_total" ;;
+		pull)  foreach_repo cmd_git_pull_one "$target"; print_summary "repos pulled" "$__walk_total" ;;
+		sync)  foreach_repo cmd_git_sync_one "$target"; print_summary "repos synced" "$__walk_total" ;;
+		*) usage_error "Missing or unknown git subcommand" "git reset|pull|sync [dir-spec]" ;;
 	esac
 }
 
-# -----------------------------------------------------------------------------
-# repos (list | dump | status | push | release)
-# -----------------------------------------------------------------------------
+# =============================================================================
+# repos
+# =============================================================================
 
 cmd_repos_list() {
 	local dir name repo branch tag_or_hash path count=0
-
 	info "Root" "$ROOT"
 	log ""
-	printf "  ${_CLR_DIM}%-28s  %-36s  %-22s  %s${_CLR_RESET}\n" \
-		"FOLDER" "REMOTE" "TAG / COMMIT" "BRANCH"
-
+	printf "  ${_CLR_DIM}%-28s  %-36s  %-22s  %s${_CLR_RESET}\n" "FOLDER" "REMOTE" "TAG / COMMIT" "BRANCH"
 	shopt -s nullglob
 	for path in "$ROOT"/*/; do
 		dir="${path%/}"
 		name="$(basename "$dir")"
-
 		if [[ ! -d "$dir/.git" && ! -f "$dir/.git" ]]; then
 			printf "  %-28s  %-36s  %-22s  %s\n" "$name" "-" "-" "-"
 			count=$((count + 1))
 			continue
 		fi
-
 		if ! repo="$(git_resolve_repo "$dir" "$OWNER" 2>/dev/null)"; then
 			repo="$(git_remote_repo "$dir" 2>/dev/null || echo "?")"
 		fi
-
 		branch="$(git_current_branch "$dir")"
 		[[ -z "$branch" ]] && branch="-"
-
 		tag_or_hash="$(git_latest_tag "$dir")"
 		if [[ -z "$tag_or_hash" ]]; then
 			tag_or_hash="$(git_head_sha "$dir")"
 			[[ -z "$tag_or_hash" ]] && tag_or_hash="-"
 		fi
-
 		printf "  %-28s  %-36s  %-22s  %s\n" "$name" "$repo" "$tag_or_hash" "$branch"
 		count=$((count + 1))
 	done
-	shopt -u nullglob
-
 	__walk_repos=$count
 	__walk_total=$count
 	print_summary "folders listed" "$count"
 }
 
 print_size() {
-	local file="$1"
-	local bytes kib
+	local file="$1" bytes kib
 	if [[ ! -e "$file" ]]; then
 		printf '  %-60s  (missing)\n' "$file"
 		return
@@ -1895,33 +1404,22 @@ print_size() {
 }
 
 dump_files_cpp() {
-	local root="$1"
-	local dest="$2"
-	local base="$3"
+	local root="$1" dest="$2" base="$3"
 	shift 3
 	local f rel
 	: > "$dest"
 	find "$root" -type f \( -name '*.hxx' -o -name '*.h' -o -name '*.cxx' \) \
 		! -path '*/.git/*' ! -path '*/build/*' ! -path '*/thirdparty/*' ! -path '*/dist/*' \
-		"$@" \
-		| sort \
-		| while IFS= read -r f; do
+		"$@" | sort | while IFS= read -r f; do
 			rel="${f#"$base"/}"
-			printf '%s\n' \
-				"//==============================================================================" \
-				"// FILE: $rel" \
-				"//==============================================================================" \
-				""
+			printf '%s\n' "//==============================================================================" "// FILE: $rel" "//==============================================================================" ""
 			cat "$f"
 			printf '\n\n'
 		done >> "$dest"
 }
 
 dump_files_cmake() {
-	local root="$1"
-	local dest="$2"
-	local base="$3"
-	local f rel
+	local root="$1" dest="$2" base="$3" f rel
 	: > "$dest"
 	find "$root" -type f \( \
 			-name 'CMakeLists.txt' -o -name '*.cmake' -o -name '*.cmake.in' -o \
@@ -1929,33 +1427,24 @@ dump_files_cmake() {
 		\) \
 		! -path '*/.git/*' ! -path '*/build/*' ! -path '*/thirdparty/*' \
 		! -path '*/dist/*' ! -path '*/pkgconf/*' ! -path '*/tools/extra/pkgconf/*' \
-		| sort \
-		| while IFS= read -r f; do
+		| sort | while IFS= read -r f; do
 			rel="${f#"$base"/}"
-			printf '%s\n' \
-				"//==============================================================================" \
+			printf '%s\n' "//==============================================================================" \
 				"// FILE: $rel (this header does not belong to original code)" \
-				"//==============================================================================" \
-				""
+				"//==============================================================================" ""
 			cat "$f"
 			printf '\n\n'
 		done >> "$dest"
 }
 
 split_file() {
-	local file="$1"
-	local prefix="$2"
-	local size_kb="$3"
-	local f
+	local file="$1" prefix="$2" size_kb="$3" f
 	local -a chunks=()
-
 	if [[ ! -s "$file" ]]; then
 		log "  (empty file, not split)"
 		return
 	fi
-
 	split -b "${size_kb}k" --numeric-suffixes=1 --suffix-length=2 "$file" "$prefix"
-
 	shopt -s nullglob
 	for f in ${prefix}*; do
 		[[ -e "$f" ]] || continue
@@ -1964,12 +1453,7 @@ split_file() {
 	done
 	chunks=(${prefix}*.txt)
 	shopt -u nullglob
-
-	if [[ ${#chunks[@]} -eq 0 ]]; then
-		log "  (no chunks)"
-		return
-	fi
-
+	[[ ${#chunks[@]} -eq 0 ]] && { log "  (no chunks)"; return; }
 	log "  Generated chunks:"
 	for f in "${chunks[@]}"; do
 		print_size "$f"
@@ -1977,9 +1461,7 @@ split_file() {
 }
 
 cmd_repos_dump() {
-	local dir="" chunk_size_kb="" type="c++"
-	local arg project out out_test candidate
-
+	local dir="" chunk_size_kb="" type="c++" arg project out out_test
 	for arg in "$@"; do
 		if [[ "$arg" == type=* ]]; then
 			type="${arg#type=}"
@@ -1991,42 +1473,16 @@ cmd_repos_dump() {
 			usage_error "Unexpected argument: $arg" "repos dump <directory> [chunk_size_kb] [type=c++|type=cmake]"
 		fi
 	done
-
-	if [[ -z "$dir" ]]; then
-		usage_error "repos dump requires a directory" "repos dump <directory> [chunk_size_kb] [type=c++|type=cmake]"
+	[[ -n "$dir" ]] || usage_error "repos dump requires a directory" "repos dump <directory> [chunk_size_kb] [type=c++|type=cmake]"
+	case "$type" in c++|cmake) ;; *) usage_error "Invalid type='$type'" "repos dump <directory> [chunk_size_kb] [type=c++|type=cmake]" ;; esac
+	if [[ -n "$chunk_size_kb" ]] && { ! [[ "$chunk_size_kb" =~ ^[0-9]+$ ]] || [[ "$chunk_size_kb" -le 0 ]]; }; then
+		displayError "chunk_size_kb must be a positive integer"
 	fi
 
-	case "$type" in
-		c++|cmake) ;;
-		*)
-			usage_error "Invalid type='$type'" "repos dump <directory> [chunk_size_kb] [type=c++|type=cmake]"
-			;;
-	esac
-
-	if [[ -n "$chunk_size_kb" ]]; then
-		if ! [[ "$chunk_size_kb" =~ ^[0-9]+$ ]] || [[ "$chunk_size_kb" -le 0 ]]; then
-			displayError "chunk_size_kb must be a positive integer"
-		fi
-	fi
-
-	if [[ "$dir" == ~* ]]; then
-		dir="${dir/#\~/$HOME}"
-	fi
-	if [[ "$dir" == /* || "$dir" == ./* || "$dir" == ../* ]]; then
-		candidate="$dir"
-	else
-		candidate="${ROOT%/}/$dir"
-	fi
-
-	if [[ ! -d "$candidate" ]]; then
-		displayError "Not a directory: $dir (tried: $candidate)"
-	fi
-
-	dir="$(cd "$candidate" && pwd)"
+	dir="$(resolve_dir_under "$ROOT" "$dir")"
 	project="$(basename "$dir")"
 	out="${OUT}/project_${project}.txt"
 	out_test="${OUT}/project_${project}_test.txt"
-
 	rm -f "$out" "$out_test"
 	rm -f "${OUT}/project_${project}_part_"*.txt
 	rm -f "${OUT}/project_${project}_test_part_"*.txt
@@ -2074,18 +1530,15 @@ cmd_repos_status_one() {
 
 	info "Path" "$dir"
 	info "Remote" "$repo"
-
 	branch="$(git_current_branch "$dir")"
 	[[ -z "$branch" ]] && branch="?"
 	info "Branch" "$branch"
-
 	if git_is_dirty "$dir"; then
 		dirty=1
 		info "Working" "dirty"
 	else
 		info "Working" "clean"
 	fi
-
 	if upstream="$(git_upstream_ref "$dir")"; then
 		info "Upstream" "$upstream"
 		if ab="$(git_ahead_behind "$dir")"; then
@@ -2103,49 +1556,36 @@ cmd_repos_status_one() {
 		info "Upstream" "none"
 		unpushed=1
 	fi
-
 	if [[ "$dirty" -eq 1 && "$unpushed" -eq 1 ]]; then
 		status_label="DIRTY+UNPUSHED"
-		warn "Status $(_clr_status_label "$status_label")"
 	elif [[ "$dirty" -eq 1 ]]; then
 		status_label="DIRTY"
-		warn "Status $(_clr_status_label "$status_label")"
 	elif [[ "$unpushed" -eq 1 ]]; then
 		status_label="UNPUSHED"
-		warn "Status $(_clr_status_label "$status_label")"
 	else
 		status_label="OK"
-		_idle "Status $(_clr_status_label "$status_label")"
 	fi
-
+	info "Status" "$(_clr_status_label "$status_label")"
 	LAST_COUNT=1
 }
 
 cmd_repos_push_one() {
-	local dir="$1" repo="$2"
-	local branch upstream
-
+	local dir="$1" repo="$2" branch
 	info "Path" "$dir"
 	info "Remote" "$repo"
-
-	branch="$(git_current_branch "$dir")"
-	info "Branch" "${branch:-?}"
-
-	if ! upstream="$(git_upstream_ref "$dir")"; then
-		warn "No upstream configured — skip push"
+	if ! git_upstream_ref "$dir" >/dev/null; then
+		warn "No upstream — skip push"
 		LAST_COUNT=0
 		return 0
 	fi
-	info "Upstream" "$upstream"
-
+	branch="$(git_current_branch "$dir")"
 	if [[ "$DRY_RUN" == "1" ]]; then
-		log "  [dry-run] would: git -C \"$dir\" push"
+		log "  [dry-run] would: git push"
 		LAST_COUNT=1
 		return 0
 	fi
-
 	if git -C "$dir" push; then
-		ok "Push succeeded"
+		ok "Pushed $branch"
 		LAST_COUNT=1
 	else
 		warn "Push failed"
@@ -2154,248 +1594,134 @@ cmd_repos_push_one() {
 }
 
 cmd_repos_release_list_one() {
-	local dir="$1"
-	repo="$2"
-	local filter_ver="${3:-}"
+	local dir="$1" repo="$2" filter_ver="${3:-}"
 	local tag name pre published url entry rest
 	local -a releases=() tags=() orphan=()
 	local -A release_tags=()
-	local count=0
+	local count=0 t
 
 	info "Path" "$dir"
 	info "Remote" "$repo"
 	[[ -n "$filter_ver" ]] && info "Filter" "$(version_plain "$filter_ver")"
 
-	mapfile -t releases < <(
-		gh release list -R "$repo" --limit 200 \
-			--json tagName,name,isPrerelease,publishedAt,url \
-			--jq '.[] | "\(.tagName)\t\(.name // "")\t\(.isPrerelease)\t\(.publishedAt // "-")\t\(.url // "")"' \
-			2>/dev/null || true
-	)
+	mapfile -t releases < <(gh_release_list "$repo" 200)
+	mapfile -t tags < <({
+		git -C "$dir" tag -l 2>/dev/null || true
+		git -C "$dir" ls-remote --tags --refs origin 2>/dev/null | sed -E 's#.*refs/tags/##' || true
+	} | sort -u)
 
-	mapfile -t tags < <(
-		{
-			git -C "$dir" tag -l 2>/dev/null || true
-			git -C "$dir" ls-remote --tags --refs origin 2>/dev/null \
-				| sed -E 's#.*refs/tags/##' || true
-		} | sort -u
-	)
-
-	if [[ ${#releases[@]} -gt 0 ]]; then
-		printf "  ${_CLR_DIM}%-22s  %-5s  %-22s  %s${_CLR_RESET}\n" \
-			"TAG" "PRE" "PUBLISHED" "TITLE / URL"
-	fi
-
-	for entry in "${releases[@]}"; do
-		[[ -z "$entry" ]] && continue
-		tag="${entry%%$'\t'*}"
-		rest="${entry#*$'\t'}"
-		name="${rest%%$'\t'*}"
-		rest="${rest#*$'\t'}"
-		pre="${rest%%$'\t'*}"
-		rest="${rest#*$'\t'}"
-		published="${rest%%$'\t'*}"
-		url="${rest#*$'\t'}"
-
-		release_tags["$tag"]=1
-		release_tags["$(version_plain "$tag")"]=1
-
-		if [[ -n "$filter_ver" ]]; then
-			local fp tp
-			fp="$(version_plain "$filter_ver")"
-			tp="$(version_plain "$tag")"
-			[[ "$tp" == "$fp" || "$tag" == "$filter_ver" || "$tag" == "v$fp" ]] || continue
-		fi
-
-		[[ "$pre" == "true" ]] && pre="yes" || pre="no"
-		published="${published%T*}"
-		[[ -z "$name" ]] && name="-"
-		printf "  %-22s  %-5s  %-22s  %s\n" "$tag" "$pre" "$published" "$name"
-		[[ -n "$url" ]] && printf "  %-22s  %-5s  %-22s  %s\n" "" "" "" "$url"
-		count=$((count + 1))
-	done
-
-	if [[ "$count" -eq 0 ]]; then
-		if [[ -n "$filter_ver" ]]; then
-			info "Releases" "none matching $(version_plain "$filter_ver")"
-		else
-			info "Releases" "none"
-		fi
+	if [[ ${#releases[@]} -eq 0 ]]; then
+		_idle "No GitHub Releases"
 	else
-		info "Releases listed" "$count"
-	fi
-
-	orphan=()
-	for tag in "${tags[@]}"; do
-		[[ -z "$tag" ]] && continue
-		if [[ -n "$filter_ver" ]]; then
-			local fp tp
-			fp="$(version_plain "$filter_ver")"
-			tp="$(version_plain "$tag")"
-			[[ "$tp" == "$fp" || "$tag" == "$filter_ver" || "$tag" == "v$fp" ]] || continue
-		fi
-		if [[ -z "${release_tags[$tag]+x}" && -z "${release_tags[$(version_plain "$tag")]+x}" ]]; then
-			orphan+=("$tag")
-		fi
-	done
-
-	if [[ ${#orphan[@]} -gt 0 ]]; then
-		echo
-		printf "  ${_CLR_BOLD_YELLOW}Note${_CLR_RESET}  ${_CLR_DIM}│${_CLR_RESET} tag(s) without a GitHub Release:\n"
-		for tag in "${orphan[@]}"; do
-			printf "    • %s\n" "$tag"
+		printf "  ${_CLR_DIM}%-20s  %-8s  %-24s  %s${_CLR_RESET}\n" "TAG" "PRE" "PUBLISHED" "TITLE"
+		for entry in "${releases[@]}"; do
+			tag="${entry%%$'\t'*}"
+			rest="${entry#*$'\t'}"
+			name="${rest%%$'\t'*}"
+			rest="${rest#*$'\t'}"
+			pre="${rest%%$'\t'*}"
+			rest="${rest#*$'\t'}"
+			published="${rest%%$'\t'*}"
+			url="${rest#*$'\t'}"
+			[[ -z "$tag" ]] && continue
+			release_tags["$(version_plain "$tag")"]=1
+			if [[ -n "$filter_ver" && "$(version_plain "$tag")" != "$(version_plain "$filter_ver")" ]]; then
+				continue
+			fi
+			printf "  %-20s  %-8s  %-24s  %s\n" "$tag" "$pre" "$published" "$name"
+			count=$((count + 1))
 		done
 	fi
 
-	ok "List complete"
+	for t in "${tags[@]}"; do
+		[[ -z "$t" ]] && continue
+		[[ -n "$filter_ver" && "$(version_plain "$t")" != "$(version_plain "$filter_ver")" ]] && continue
+		[[ -n "${release_tags[$(version_plain "$t")]+x}" ]] && continue
+		orphan+=("$t")
+	done
+	if [[ ${#orphan[@]} -gt 0 ]]; then
+		info "Tags without a GitHub Release" "${orphan[*]}"
+	fi
+	ok "Listed $count release(s)"
 	LAST_COUNT=$count
 }
 
 cmd_repos_release() {
-	local spec="" version="" skip_ci=0 do_delete=0 do_list=0
-	local dir repo branch changelog notes_file sha ver_plain last_tag last_plain
-	local recreate=0 tag confirm
-	local -a prerelease_args=() positionals=()
-	local arg has_release has_tag
+	local spec="" version="" do_list=0 do_delete=0 skip_ci=0
+	local dir repo ver_plain tag confirm has_release has_tag recreate=0
+	local branch sha last_tag last_plain notes_file notes pre=0
 
-	for arg in "$@"; do
-		case "$arg" in
-			--skip-ci) skip_ci=1 ;;
-			--delete)  do_delete=1 ;;
-			--list)    do_list=1 ;;
-			-*)
-				usage_error "Unknown option: $arg" \
-					"repos release [dir-spec] [version] [--list | --delete | --skip-ci]"
-				;;
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+			--list) do_list=1; shift ;;
+			--delete) do_delete=1; shift ;;
+			--skip-ci) skip_ci=1; shift ;;
+			-*) usage_error "Unknown option: $1" "repos release [dir-spec] [version] [--list | --delete | --skip-ci]" ;;
 			*)
-				positionals+=("$arg")
+				if [[ -z "$spec" ]]; then
+					spec="$1"
+				elif [[ -z "$version" ]]; then
+					version="$1"
+				else
+					usage_error "Unexpected argument: $1" "repos release [dir-spec] [version] [--list | --delete | --skip-ci]"
+				fi
+				shift
 				;;
 		esac
 	done
 
 	if [[ "$do_list" -eq 1 ]]; then
-		case ${#positionals[@]} in
-			0)
-				spec=""
-				version=""
-				;;
-			1)
-				if version_is_valid "${positionals[0]}"; then
-					spec=""
-					version="${positionals[0]}"
-				else
-					spec="${positionals[0]}"
-					version=""
-				fi
-				;;
-			2)
-				spec="${positionals[0]}"
-				version="${positionals[1]}"
-				;;
-			*)
-				usage_error "Too many arguments for --list" \
-					"repos release [dir-spec] [version] --list"
-				;;
-		esac
-	else
-		case ${#positionals[@]} in
-			0|1)
-				usage_error "repos release requires <dir> and <version> (unless --list)" \
-					"repos release <dir> <version> [--skip-ci | --delete] | repos release [dir-spec] [version] --list"
-				;;
-			2)
-				spec="${positionals[0]}"
-				version="${positionals[1]}"
-				;;
-			*)
-				usage_error "Unexpected extra arguments" \
-					"repos release <dir> <version> [--skip-ci | --delete] | repos release [dir-spec] [version] --list"
-				;;
-		esac
-	fi
-
-	if [[ "$do_list" -eq 1 && ( "$do_delete" -eq 1 || "$skip_ci" -eq 1 ) ]]; then
-		warn "--delete / --skip-ci are ignored with --list"
-	fi
-	if [[ "$do_delete" -eq 1 && "$skip_ci" -eq 1 && "$do_list" -eq 0 ]]; then
-		warn "--skip-ci is ignored with --delete"
-	fi
-	if [[ "$do_list" -eq 1 && "$do_delete" -eq 1 ]]; then
-		displayError "Use either --list or --delete, not both"
-	fi
-
-	# -------------------------------------------------------------------------
-	# LIST
-	# -------------------------------------------------------------------------
-	if [[ "$do_list" -eq 1 ]]; then
+		if [[ -n "$spec" && "$spec" != '!'* && ! "$(version_is_valid "$spec" && echo 1)" ]]; then
+			:
+		fi
+		if [[ -n "$spec" && -z "$version" ]] && version_is_valid "$spec"; then
+			version="$spec"
+			spec=""
+		fi
 		local filter_ver=""
 		[[ -n "$version" ]] && filter_ver="$(version_plain "$version")"
-
 		if [[ -n "$spec" && "$spec" != '!'* ]]; then
 			dir="$(resolve_repo_dir "$spec" "$ROOT")"
 			[[ -d "$dir" ]] || displayError "Directory does not exist: $dir"
 			section "$(basename "$dir")"
-			repo="$(git_resolve_repo "$dir" "$OWNER")" \
-				|| displayError "Target must be a ${OWNER} git repository: $dir"
+			repo="$(git_resolve_repo "$dir" "$OWNER")" || displayError "Target must be a ${OWNER} git repository: $dir"
 			LAST_COUNT=0
 			cmd_repos_release_list_one "$dir" "$repo" "$filter_ver"
 			print_summary "releases listed" "$LAST_COUNT"
 			return 0
 		fi
-
-		_release_list_walk() {
-			local d="$1" r="$2"
-			cmd_repos_release_list_one "$d" "$r" "$filter_ver"
-		}
-		foreach_repo _release_list_walk "$spec"
+		__walk_total=0
+		foreach_repo cmd_repos_release_list_one "$spec"
 		print_summary "releases listed" "$__walk_total"
 		return 0
 	fi
 
-	# -------------------------------------------------------------------------
-	# Shared validation for CREATE / DELETE
-	# -------------------------------------------------------------------------
-	version_is_valid "$version" \
-		|| displayError "Invalid version: $version (expected e.g. 1.0.0 or 1.0.0-rc.1)"
-
+	[[ -n "$spec" && -n "$version" ]] || usage_error "CREATE/DELETE need <dir> <version>" \
+		"repos release <dir> <version> [--delete | --skip-ci]"
+	version_is_valid "$version" || displayError "Invalid version: $version (expected e.g. 1.0.0 or 1.0.0-rc.1)"
 	ver_plain="$(version_plain "$version")"
 	tag="$version"
-
 	dir="$(resolve_repo_dir "$spec" "$ROOT")"
 	[[ -d "$dir" ]] || displayError "Directory does not exist: $dir"
-
-	repo="$(git_resolve_repo "$dir" "$OWNER")" \
-		|| displayError "Target must be a ${OWNER} git repository: $dir"
-
+	repo="$(git_resolve_repo "$dir" "$OWNER")" || displayError "Target must be a ${OWNER} git repository: $dir"
 	section "$(basename "$dir")"
 	info "Path" "$dir"
 	info "Remote" "$repo"
 	info "Version / tag" "$tag"
-	if [[ "$do_delete" -eq 1 ]]; then
-		info "Mode" "DELETE"
-	else
-		info "Mode" "CREATE"
-	fi
 
-	# -------------------------------------------------------------------------
-	# DELETE
-	# -------------------------------------------------------------------------
 	if [[ "$do_delete" -eq 1 ]]; then
 		has_release=0
 		has_tag=0
-		gh release view "$tag" -R "$repo" >/dev/null 2>&1 && has_release=1
+		gh_release_exists "$repo" "$tag" && has_release=1
 		git_tag_exists_local "$dir" "$tag" && has_tag=1
 		git_tag_exists_remote "$dir" "$tag" && has_tag=1
-
 		if [[ "$has_release" -eq 0 && "$has_tag" -eq 0 ]]; then
 			warn "No GitHub release or tag named $tag — nothing to delete"
 			ok "Delete complete (noop)"
 			LAST_COUNT=0
 			return 0
 		fi
-
-		echo
-		printf '  %sAbout to DELETE%s\n' "${_CLR_BOLD}" "${_CLR_RESET}"
+		printf '  %sAbout to delete%s\n' "${_CLR_BOLD}" "${_CLR_RESET}"
 		printf '    repo:    %s\n' "$repo"
 		printf '    tag:     %s\n' "$tag"
 		[[ "$has_release" -eq 1 ]] && printf '    release: will remove GitHub Release\n'
@@ -2404,117 +1730,82 @@ cmd_repos_release() {
 		printf '  Type %syes%s to continue: ' "${_CLR_BOLD}" "${_CLR_RESET}"
 		read -r confirm
 		[[ "$confirm" == "yes" ]] || displayError "Aborted (confirmation was not exactly \"yes\")"
-
 		if [[ "$DRY_RUN" == "1" ]]; then
 			log "  [dry-run] would: gh release delete $tag; delete tag local+origin"
 			ok "Dry-run complete"
 			LAST_COUNT=1
 			return 0
 		fi
-
 		if [[ "$has_release" -eq 1 ]]; then
 			info "GitHub Release" "deleting $tag"
-			gh release delete "$tag" -R "$repo" --yes \
-				|| displayError "gh release delete failed"
+			gh_release_delete "$repo" "$tag" || displayError "gh release delete failed"
 		fi
-
 		info "Tag" "deleting $tag (local + origin)"
 		git_tag_delete_local_remote "$dir" "$tag"
-
 		ok "Deleted $tag on $repo"
 		LAST_COUNT=1
 		return 0
 	fi
 
-	# -------------------------------------------------------------------------
-	# CREATE
-	# -------------------------------------------------------------------------
-	git_is_dirty "$dir" \
-		&& displayError "Working tree is not clean — commit or stash before release"
-
+	info "Mode" "CREATE"
 	branch="$(git_current_branch "$dir")"
-	[[ -n "$branch" ]] || displayError "Cannot resolve current branch"
-	info "Branch" "$branch"
-	case "$branch" in
-		master|main) ;;
-		*) displayError "Release only allowed on master or main (current: $branch)" ;;
-	esac
-
-	changelog="$dir/CHANGELOG.md"
-	[[ -f "$changelog" ]] \
-		|| displayError "CHANGELOG.md not found — create it first (## [$ver_plain] - YYYY-MM-DD)"
-
+	[[ "$branch" == "master" || "$branch" == "main" ]] || displayError "Must be on master/main (now: $branch)"
+	git_is_dirty "$dir" && displayError "Working tree is dirty — commit or stash first"
 	notes_file="$(mktemp)"
-	# Expand path at trap setup time so RETURN does not touch a destroyed local under set -u
-	trap "rm -f -- $(printf '%q' "$notes_file")" RETURN
-
-	if ! git_changelog_extract_notes "$changelog" "$ver_plain" > "$notes_file"; then
-		displayError "CHANGELOG.md has no non-empty section for $ver_plain (need: ## [$ver_plain] - YYYY-MM-DD)"
+	if ! git_changelog_extract_notes "$dir/CHANGELOG.md" "$ver_plain" > "$notes_file"; then
+		rm -f "$notes_file"
+		displayError "CHANGELOG.md has no section for $ver_plain"
 	fi
-	info "Notes" "from CHANGELOG.md ($(wc -l < "$notes_file" | tr -d ' ') lines)"
-
 	last_tag="$(git_latest_tag "$dir")"
 	if [[ -n "$last_tag" ]]; then
-		info "Latest tag" "$last_tag"
 		last_plain="$(version_plain "$last_tag")"
-		if semver_lt "$ver_plain" "$last_plain"; then
-			displayError "Version $ver_plain is older than latest tag $last_tag"
-		elif semver_eq "$ver_plain" "$last_plain"; then
+		if version_is_valid "$last_plain" && semver_eq "$ver_plain" "$last_plain"; then
 			recreate=1
 			warn "Same core version as $last_tag — will delete existing tag/release and recreate"
 		fi
 	fi
-
 	if git_tag_exists_local "$dir" "$tag" || git_tag_exists_remote "$dir" "$tag"; then
 		recreate=1
 		warn "Tag $tag already exists — will delete and recreate"
 	fi
-	if gh release view "$tag" -R "$repo" >/dev/null 2>&1; then
+	if gh_release_exists "$repo" "$tag"; then
 		recreate=1
 		warn "GitHub release $tag exists — will delete and recreate"
 	fi
-
 	sha="$(git_head_sha_full "$dir")"
 	info "HEAD" "${sha:0:12}"
-
 	echo
 	printf '  %sAbout to release%s\n' "${_CLR_BOLD}" "${_CLR_RESET}"
 	printf '    repo:    %s\n' "$repo"
-	printf '    branch:  %s\n' "$branch"
 	printf '    tag:     %s\n' "$tag"
-	printf '    commit:  %s\n' "$sha"
-	[[ "$recreate" -eq 1 ]] && printf '    mode:    %sREPLACE existing tag/release%s\n' "${_CLR_BOLD_YELLOW}" "${_CLR_RESET}"
-	if [[ "$skip_ci" -eq 1 ]]; then
-		printf '    CI:      skipped (--skip-ci)\n'
-	else
-		printf '    CI:      wait for green (may take a long time; Ctrl-C is safe)\n'
-	fi
+	printf '    branch:  %s\n' "$branch"
+	[[ "$recreate" -eq 1 ]] && printf '    note:    existing tag/release will be recreated\n'
 	echo
 	printf '  --- release notes ---\n'
 	sed 's/^/  /' "$notes_file"
 	echo
 	printf '  Type %syes%s to continue: ' "${_CLR_BOLD}" "${_CLR_RESET}"
 	read -r confirm
-	[[ "$confirm" == "yes" ]] || displayError "Aborted (confirmation was not exactly \"yes\")"
+	[[ "$confirm" == "yes" ]] || { rm -f "$notes_file"; displayError "Aborted (confirmation was not exactly \"yes\")"; }
 
 	if [[ "$DRY_RUN" == "1" ]]; then
 		log "  [dry-run] pull --rebase, optional delete old tag/release, wait CI, tag, push, gh release create"
 		ok "Dry-run complete"
+		rm -f "$notes_file"
 		LAST_COUNT=1
 		return 0
 	fi
 
 	info "Sync" "fetch + pull --rebase (superproject only)"
 	git -C "$dir" fetch origin || displayError "git fetch failed"
-	git -C "$dir" pull --rebase --no-recurse-submodules \
-		|| displayError "git pull --rebase failed"
+	git -C "$dir" pull --rebase --no-recurse-submodules || displayError "git pull --rebase failed"
 	git -C "$dir" submodule update --init --recursive >/dev/null 2>&1 || true
-	git_is_dirty "$dir" && displayError "Dirty after pull — resolve before release"
 	sha="$(git_head_sha_full "$dir")"
 
 	if [[ "$skip_ci" -eq 0 ]]; then
 		info "CI" "waiting for green on $sha"
-		if ! git_wait_ci_success "$repo" "$sha"; then
+		if ! gh_wait_ci_success "$repo" "$sha"; then
+			rm -f "$notes_file"
 			displayError "CI not green — release aborted (nothing tagged)"
 		fi
 	else
@@ -2523,15 +1814,12 @@ cmd_repos_release() {
 
 	if [[ "$recreate" -eq 1 ]]; then
 		info "Cleanup" "deleting existing GitHub release and tag $tag"
-		gh release delete "$tag" -R "$repo" --yes 2>/dev/null || true
+		gh_release_delete "$repo" "$tag" || true
 		git_tag_delete_local_remote "$dir" "$tag"
 	fi
 
 	info "Tag" "$tag"
-	if ! git -C "$dir" tag -a "$tag" -m "Version $ver_plain released"; then
-		displayError "git tag failed"
-	fi
-
+	git -C "$dir" tag -a "$tag" -m "Version $ver_plain released" || displayError "git tag failed"
 	info "Push" "branch $branch + tag $tag"
 	if ! git -C "$dir" push origin "$branch"; then
 		git -C "$dir" tag -d "$tag" >/dev/null 2>&1 || true
@@ -2543,21 +1831,15 @@ git push origin $tag
 gh release create $tag -R $repo --title \"Version $ver_plain\" --notes-file <notes>"
 	fi
 
-	prerelease_args=()
-	if version_is_prerelease "$ver_plain"; then
-		prerelease_args=(--prerelease)
-		info "Prerelease" "yes"
-	fi
-
+	version_is_prerelease "$ver_plain" && pre=1
+	[[ "$pre" -eq 1 ]] && info "Prerelease" "yes"
 	info "GitHub Release" "$tag"
-	if ! gh release create "$tag" -R "$repo" \
-		--title "Version $ver_plain" \
-		--notes-file "$notes_file" \
-		"${prerelease_args[@]}"; then
+	if ! gh_release_create "$repo" "$tag" "Version $ver_plain" "$notes_file" "$pre"; then
+		rm -f "$notes_file"
 		displayError "gh release create failed — tag is on origin. Recover with:
 gh release create $tag -R $repo --title \"Version $ver_plain\" --notes-file <changelog-section>"
 	fi
-
+	rm -f "$notes_file"
 	ok "Released $tag → https://github.com/$repo/releases/tag/$tag"
 	LAST_COUNT=1
 }
@@ -2565,55 +1847,30 @@ gh release create $tag -R $repo --title \"Version $ver_plain\" --notes-file <cha
 cmd_repos() {
 	local sub="${1:-}"
 	shift || true
-	local target="${1:-}"
-
 	case "$sub" in
-		list)
-			cmd_repos_list
-			;;
-		dump)
-			cmd_repos_dump "$@"
-			;;
-		status)
-			foreach_repo cmd_repos_status_one "$target"
-			print_summary "repos checked" "$__walk_repos"
-			;;
-		push)
-			[[ "$DRY_RUN" == "1" ]] && info "Mode" "DRY_RUN"
-			foreach_repo cmd_repos_push_one "$target"
-			print_summary "repos pushed" "$__walk_total"
-			;;
-		release)
-			[[ "$DRY_RUN" == "1" ]] && info "Mode" "DRY_RUN"
-			cmd_repos_release "$@"
-			;;
-		*)
-			usage_error "Missing or unknown repos subcommand" \
-				"repos list | dump | status [dir-spec] | push [dir-spec] | release [dir-spec] [version] [--list | --delete | --skip-ci]"
-			;;
+		list)   cmd_repos_list ;;
+		dump)   cmd_repos_dump "$@" ;;
+		status) foreach_repo cmd_repos_status_one "${1:-}"; print_summary "repos checked" "$__walk_repos" ;;
+		push)   foreach_repo cmd_repos_push_one "${1:-}"; print_summary "repos pushed" "$__walk_total" ;;
+		release) cmd_repos_release "$@" ;;
+		*) usage_error "Missing or unknown repos subcommand" "repos list|dump|status|push|release …" ;;
 	esac
 }
 
-# -----------------------------------------------------------------------------
-# clone-all
-# -----------------------------------------------------------------------------
+# =============================================================================
+# clone / search / fork
+# =============================================================================
 
 cmd_clone_all() {
-	local repos name dir cloned=0 skipped=0
-
+	local name dir cloned=0 skipped=0
+	local -a repos=()
 	info "Owner" "$OWNER"
 	info "Target" "$ROOT"
-
-	mapfile -t repos < <(
-		gh repo list "$OWNER" --limit 1000 --json name,isPrivate \
-			--jq '.[] | select(.isPrivate == false) | .name' 2>/dev/null || true
-	)
-
+	mapfile -t repos < <(gh_repo_list_public "$OWNER" 1000)
 	if [[ ${#repos[@]} -eq 0 ]]; then
 		warn "No public repositories found for $OWNER"
 		return 0
 	fi
-
 	for name in "${repos[@]}"; do
 		dir="$ROOT/$name"
 		if [[ -d "$dir" ]]; then
@@ -2627,35 +1884,26 @@ cmd_clone_all() {
 			continue
 		fi
 		log "  cloning $OWNER/$name ..."
-		if gh repo clone "$OWNER/$name" "$dir" 2>/dev/null; then
+		if gh_repo_clone "$OWNER/$name" "$dir"; then
 			ok "Cloned $name"
 			cloned=$((cloned + 1))
 		else
 			warn "Failed to clone $name"
 		fi
 	done
-
+	__walk_repos=$cloned
 	print_summary "cloned" "$cloned"
 	info "Skipped (already present)" "$skipped"
 }
 
-# -----------------------------------------------------------------------------
-# search
-# -----------------------------------------------------------------------------
-
 cmd_search() {
-	local query="${1:-}"
-	local target="${2:-}"
-
+	local query="${1:-}" target="${2:-}"
 	[[ -z "$query" ]] && usage_error "search requires a text query" "search <text> [dir-spec]"
-
 	SEARCH_QUERY="$query"
-
 	cmd_search_one() {
 		local dir="$1" repo="$2"
 		info "Remote" "$repo"
 		info "Query" "$SEARCH_QUERY"
-
 		if command -v rg >/dev/null 2>&1; then
 			rg -n --color always -S "$SEARCH_QUERY" "$dir" \
 				--glob '!.git/*' --glob '!build/*' --glob '!thirdparty/*' --glob '!dist/*' \
@@ -2668,30 +1916,21 @@ cmd_search() {
 		ok "Search finished"
 		LAST_COUNT=1
 	}
-
 	foreach_repo cmd_search_one "$target"
 	print_summary "repos searched" "$__walk_repos"
 }
 
-# -----------------------------------------------------------------------------
-# fork
-# -----------------------------------------------------------------------------
-
 cmd_fork_status_one() {
-	local dir="$1" repo="$2"
-	local behind ahead
-
+	local dir="$1" repo="$2" behind ahead behind_ahead
 	info "Remote" "$repo"
-
-	if ! git_is_fork "$repo"; then
+	if ! gh_is_fork "$repo"; then
 		info "Fork" "no"
 		_idle "Not a fork"
 		LAST_COUNT=0
 		return 0
 	fi
-
 	info "Fork" "yes"
-	if behind_ahead="$(git_fork_compare "$repo" 2>/dev/null)"; then
+	if behind_ahead="$(gh_fork_compare "$repo" 2>/dev/null)"; then
 		behind="${behind_ahead%% *}"
 		ahead="${behind_ahead##* }"
 		info "Behind/Ahead" "${behind:-?} / ${ahead:-?}"
@@ -2703,37 +1942,29 @@ cmd_fork_status_one() {
 }
 
 cmd_fork_branch_status_one() {
-	local dir="$1" repo="$2"
-	local branch count=0 note tip merge_label
+	local dir="$1" repo="$2" branch count=0 note tip merge_label
 	local -a branches=()
-
 	info "Path" "$dir"
 	info "Remote" "$repo"
-
-	if ! git -C "$dir" rev-parse --verify master^{commit} >/dev/null 2>&1; then
+	if ! git -C "$dir" rev-parse --verify 'master^{commit}' >/dev/null 2>&1; then
 		warn "No local master branch — cannot check mergeability"
 		LAST_COUNT=0
 		return 0
 	fi
-
 	mapfile -t branches < <(
-		git -C "$dir" for-each-ref --format='%(refname:short)' refs/heads/ 2>/dev/null \
-			| grep -vx 'master' || true
+		git -C "$dir" for-each-ref --format='%(refname:short)' refs/heads/ 2>/dev/null | grep -vx 'master' || true
 	)
-
 	if [[ ${#branches[@]} -eq 0 ]]; then
 		info "Branches" "no branches other than master"
 		_idle "Nothing to check"
 		LAST_COUNT=0
 		return 0
 	fi
-
 	printf "  ${_CLR_DIM}%-36s  %-12s  %s${_CLR_RESET}\n" "BRANCH" "MERGE→master" "NOTE"
 	for branch in "${branches[@]}"; do
 		[[ -z "$branch" ]] && continue
 		note=""
 		tip="$branch"
-
 		if git -C "$dir" show-ref --verify --quiet "refs/remotes/origin/${branch}" 2>/dev/null; then
 			tip="origin/${branch}"
 			if ! git -C "$dir" rev-parse --verify "$branch^{commit}" >/dev/null 2>&1; then
@@ -2749,55 +1980,43 @@ cmd_fork_branch_status_one() {
 				tip="$branch"
 			fi
 		fi
-
 		if git_merge_tree_clean "$dir" "master" "$tip"; then
 			merge_label="CLEAN"
 		else
 			merge_label="CONFLICTS"
 		fi
-
 		printf "  %-36s  %-12s  %s\n" "$branch" "$(_clr_merge_label "$merge_label")" "$note"
 		count=$((count + 1))
 	done
-
 	info "Checked" "$count branch(es)"
 	ok "Branch status done"
 	LAST_COUNT=$count
 }
 
 cmd_fork_sync_one() {
-	local dir="$1" repo="$2"
-	local behind ahead
-
+	local dir="$1" repo="$2" behind=0 ahead=0 behind_ahead
 	info "Remote" "$repo"
-
-	if ! git_is_fork "$repo"; then
+	if ! gh_is_fork "$repo"; then
 		err "Not a fork: $repo — refusing to sync"
 		return 1
 	fi
-
-	behind=0
-	ahead=0
-	if behind_ahead="$(git_fork_compare "$repo" 2>/dev/null)"; then
+	if behind_ahead="$(gh_fork_compare "$repo" 2>/dev/null)"; then
 		behind="${behind_ahead%% *}"
 		ahead="${behind_ahead##* }"
 		[[ "$behind" =~ ^[0-9]+$ ]] || behind=0
 		[[ "$ahead"  =~ ^[0-9]+$ ]] || ahead=0
 	fi
-
 	if [[ "$behind" -eq 0 ]]; then
 		_idle "Already up to date with upstream (behind=$behind, ahead=$ahead) — skip"
 		LAST_COUNT=0
 		return 0
 	fi
-
 	if [[ "$DRY_RUN" == "1" ]]; then
 		log "  [dry-run] would sync ONLY master ($behind commits behind, $ahead ahead)"
 		LAST_COUNT=1
 		return 0
 	fi
-
-	if git_fork_sync_master "$dir" "$repo"; then
+	if gh_fork_sync_master "$dir" "$repo"; then
 		ok "master synced with upstream (was $behind behind)"
 		LAST_COUNT=1
 	else
@@ -2807,171 +2026,67 @@ cmd_fork_sync_one() {
 }
 
 cmd_fork() {
-	local sub="${1:-}"
-	local target="${2:-}"
-	local effective
-
+	local sub="${1:-}" target="${2:-}" effective
 	effective="$(fork_effective_root)"
 	info "Fork root" "$effective"
-
 	case "$sub" in
-		status)
-			foreach_repo cmd_fork_status_one "$target" "$effective"
-			print_summary "forks checked" "$__walk_total"
-			;;
-		sync)
-			foreach_repo cmd_fork_sync_one "$target" "$effective"
-			print_summary "forks synced" "$__walk_total"
-			;;
-		branch-status)
-			foreach_repo cmd_fork_branch_status_one "$target" "$effective"
-			print_summary "branches checked" "$__walk_total"
-			;;
-		*)
-			usage_error "Missing or unknown fork subcommand" \
-				"fork status|sync|branch-status [dir-spec]"
-			;;
+		status)        foreach_repo cmd_fork_status_one "$target" "$effective"; print_summary "forks checked" "$__walk_total" ;;
+		sync)          foreach_repo cmd_fork_sync_one "$target" "$effective"; print_summary "forks synced" "$__walk_total" ;;
+		branch-status) foreach_repo cmd_fork_branch_status_one "$target" "$effective"; print_summary "branches checked" "$__walk_total" ;;
+		*) usage_error "Missing or unknown fork subcommand" "fork status|sync|branch-status [dir-spec]" ;;
 	esac
 }
 
-# -----------------------------------------------------------------------------
-# test (asan | tsan)
-# -----------------------------------------------------------------------------
+# =============================================================================
+# test
+# =============================================================================
 
 cmd_test() {
 	local sub="${1:-}"
 	shift || true
-
 	case "$sub" in
-		asan|tsan)
-			_cmd_test_dispatch "$sub" "$@"
-			;;
-		*)
-			usage_error "Missing or unknown test subcommand" \
-				"test asan|tsan [dir-spec] [--builddir DIR] [--testdir DIR] [--outfile FILE] [--cmake-options \"opts\"] [--executable PATH] [--test REGEX] [--asan-options \"opts\"] [--tsan-options \"opts\"] [--verbose]"
-			;;
+		asan|tsan) _cmd_test_dispatch "$sub" "$@" ;;
+		*) usage_error "Missing or unknown test subcommand" \
+			"test asan|tsan [dir-spec] [--builddir DIR] [--testdir DIR] [--outfile FILE] [--cmake-options \"opts\"] [--executable PATH] [--test REGEX] [--asan-options \"opts\"] [--tsan-options \"opts\"] [--verbose]" ;;
 	esac
 }
 
 _cmd_test_dispatch() {
 	local kind="$1"
 	shift
-
-	# Shared options (parsed once)
-	local target="" builddir="" testdir="" outfile="" cmake_opts="" executable="" test_regex=""
-	local asan_opts="" tsan_opts="" verbose=0
-	local arg
-
-	# Defaults
-	builddir="build-${kind}"
-	testdir=""
-	outfile=""
-	cmake_opts="-DENABLE_TEST=ON"
-	asan_opts="abort_on_error=1:halt_on_error=1:detect_leaks=1:symbolize=1:print_stacktrace=1"
-	tsan_opts="abort_on_error=1:halt_on_error=1:symbolize=1:print_stacktrace=1"
+	local target="" builddir="build-${kind}" testdir="" outfile=""
+	local cmake_opts="-DENABLE_TEST=ON" executable="" test_regex=""
+	local asan_opts="abort_on_error=1:halt_on_error=1:detect_leaks=1:symbolize=1:print_stacktrace=1"
+	local tsan_opts="abort_on_error=1:halt_on_error=1:symbolize=1:print_stacktrace=1"
+	local verbose=0
 
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
-			--builddir)
-				shift
-				[[ $# -gt 0 ]] || usage_error "--builddir requires a value" "test ${kind} [dir-spec] [options]"
-				builddir="$1"
-				shift
-				;;
-			--builddir=*)
-				builddir="${1#--builddir=}"
-				shift
-				;;
-			--testdir)
-				shift
-				[[ $# -gt 0 ]] || usage_error "--testdir requires a value" "test ${kind} [dir-spec] [options]"
-				testdir="$1"
-				shift
-				;;
-			--testdir=*)
-				testdir="${1#--testdir=}"
-				shift
-				;;
-			--outfile)
-				shift
-				[[ $# -gt 0 ]] || usage_error "--outfile requires a value" "test ${kind} [dir-spec] [options]"
-				outfile="$1"
-				shift
-				;;
-			--outfile=*)
-				outfile="${1#--outfile=}"
-				shift
-				;;
-			--cmake-options)
-				shift
-				[[ $# -gt 0 ]] || usage_error "--cmake-options requires a value" "test ${kind} [dir-spec] [options]"
-				cmake_opts="$1"
-				shift
-				;;
-			--cmake-options=*)
-				cmake_opts="${1#--cmake-options=}"
-				shift
-				;;
-			--executable)
-				shift
-				[[ $# -gt 0 ]] || usage_error "--executable requires a value" "test ${kind} [dir-spec] [options]"
-				executable="$1"
-				shift
-				;;
-			--executable=*)
-				executable="${1#--executable=}"
-				shift
-				;;
-			--test)
-				shift
-				[[ $# -gt 0 ]] || usage_error "--test requires a value" "test ${kind} [dir-spec] [options]"
-				test_regex="$1"
-				shift
-				;;
-			--test=*)
-				test_regex="${1#--test=}"
-				shift
-				;;
-			--asan-options)
-				shift
-				[[ $# -gt 0 ]] || usage_error "--asan-options requires a value" "test ${kind} [dir-spec] [options]"
-				asan_opts="$1"
-				shift
-				;;
-			--asan-options=*)
-				asan_opts="${1#--asan-options=}"
-				shift
-				;;
-			--tsan-options)
-				shift
-				[[ $# -gt 0 ]] || usage_error "--tsan-options requires a value" "test ${kind} [dir-spec] [options]"
-				tsan_opts="$1"
-				shift
-				;;
-			--tsan-options=*)
-				tsan_opts="${1#--tsan-options=}"
-				shift
-				;;
-			--verbose)
-				verbose=1
-				shift
-				;;
-			-*)
-				usage_error "Unknown option: $1" \
-					"test asan|tsan [dir-spec] [--builddir DIR] [--testdir DIR] [--outfile FILE] [--cmake-options \"opts\"] [--executable PATH] [--test REGEX] [--asan-options \"opts\"] [--tsan-options \"opts\"] [--verbose]"
-				;;
+			--builddir) shift; [[ $# -gt 0 ]] || usage_error "--builddir requires a value" "test ${kind} …"; builddir="$1"; shift ;;
+			--builddir=*) builddir="${1#--builddir=}"; shift ;;
+			--testdir) shift; [[ $# -gt 0 ]] || usage_error "--testdir requires a value" "test ${kind} …"; testdir="$1"; shift ;;
+			--testdir=*) testdir="${1#--testdir=}"; shift ;;
+			--outfile) shift; [[ $# -gt 0 ]] || usage_error "--outfile requires a value" "test ${kind} …"; outfile="$1"; shift ;;
+			--outfile=*) outfile="${1#--outfile=}"; shift ;;
+			--cmake-options) shift; [[ $# -gt 0 ]] || usage_error "--cmake-options requires a value" "test ${kind} …"; cmake_opts="$1"; shift ;;
+			--cmake-options=*) cmake_opts="${1#--cmake-options=}"; shift ;;
+			--executable) shift; [[ $# -gt 0 ]] || usage_error "--executable requires a value" "test ${kind} …"; executable="$1"; shift ;;
+			--executable=*) executable="${1#--executable=}"; shift ;;
+			--test) shift; [[ $# -gt 0 ]] || usage_error "--test requires a value" "test ${kind} …"; test_regex="$1"; shift ;;
+			--test=*) test_regex="${1#--test=}"; shift ;;
+			--asan-options) shift; [[ $# -gt 0 ]] || usage_error "--asan-options requires a value" "test ${kind} …"; asan_opts="$1"; shift ;;
+			--asan-options=*) asan_opts="${1#--asan-options=}"; shift ;;
+			--tsan-options) shift; [[ $# -gt 0 ]] || usage_error "--tsan-options requires a value" "test ${kind} …"; tsan_opts="$1"; shift ;;
+			--tsan-options=*) tsan_opts="${1#--tsan-options=}"; shift ;;
+			--verbose) verbose=1; shift ;;
+			-*) usage_error "Unknown option: $1" "test asan|tsan [dir-spec] [options]" ;;
 			*)
-				if [[ -z "$target" ]]; then
-					target="$1"
-					shift
-				else
-					usage_error "Unexpected argument: $1" "test ${kind} [dir-spec] [options]"
-				fi
+				if [[ -z "$target" ]]; then target="$1"; shift
+				else usage_error "Unexpected argument: $1" "test ${kind} [dir-spec] [options]"; fi
 				;;
 		esac
 	done
 
-	# Export options so the per-repo callback can see them
 	_TEST_KIND="$kind"
 	_TEST_BUILDDIR="$builddir"
 	_TEST_TESTDIR="$testdir"
@@ -2982,33 +2097,22 @@ _cmd_test_dispatch() {
 	_TEST_ASAN_OPTS="$asan_opts"
 	_TEST_TSAN_OPTS="$tsan_opts"
 	_TEST_VERBOSE="$verbose"
-
 	foreach_repo _cmd_test_one "$target"
 	print_summary "repos tested" "$__walk_repos"
 }
 
 _cmd_test_one() {
 	local dir="$1" repo="$2"
-	local kind="$_TEST_KIND"
-	local builddir="$_TEST_BUILDDIR"
-	local testdir="$_TEST_TESTDIR"
-	local outfile="$_TEST_OUTFILE"
-	local cmake_opts="$_TEST_CMAKE_OPTS"
-	local executable="$_TEST_EXECUTABLE"
-	local test_regex="$_TEST_REGEX"
-	local asan_opts="$_TEST_ASAN_OPTS"
-	local tsan_opts="$_TEST_TSAN_OPTS"
-	local verbose="$_TEST_VERBOSE"
-	local name build_abs test_abs out_file
-	local -a cmake_cmd=() cmake_extra=()
-	local rc=0 tmp_out run_output
+	local kind="$_TEST_KIND" builddir="$_TEST_BUILDDIR" testdir="$_TEST_TESTDIR"
+	local outfile="$_TEST_OUTFILE" cmake_opts="$_TEST_CMAKE_OPTS"
+	local executable="$_TEST_EXECUTABLE" test_regex="$_TEST_REGEX"
+	local asan_opts="$_TEST_ASAN_OPTS" tsan_opts="$_TEST_TSAN_OPTS" verbose="$_TEST_VERBOSE"
+	local name build_abs test_abs out_file rc=0
+	local -a cmake_cmd=() cmake_extra=() ctest_cmd=()
 
 	name="$(basename "$dir")"
-
-	# Per-repo defaults
 	[[ -z "$testdir" ]] && testdir="${builddir}/test"
 	[[ -z "$outfile" ]] && out_file="/tmp/${name}_${kind}_report.txt" || out_file="$outfile"
-
 	build_abs="$(cd "$dir" && realpath -m "$builddir")"
 	test_abs="$(cd "$dir" && realpath -m "$testdir")"
 
@@ -3022,200 +2126,98 @@ _cmd_test_one() {
 	[[ "$verbose" -eq 1 ]] && info "Verbose" "yes"
 	info "CMake opts" "$cmake_opts"
 
-	# Safety: build directory must NOT exist
 	if [[ -e "$build_abs" ]]; then
 		err "Build directory already exists (safety): $build_abs — skip"
 		LAST_COUNT=0
 		return 0
 	fi
-
-	# Guaranteed cleanup — expand the path NOW (local vars die on RETURN)
 	trap "rm -rf -- $(printf '%q' "$build_abs")" RETURN
 
-	# -----------------------------------------------------------------
-	# 1. Configure
-	# -----------------------------------------------------------------
-	cmake_cmd=(
-		cmake -S "$dir" -B "$build_abs"
-		-DCMAKE_BUILD_TYPE=Debug
-	)
-
+	cmake_cmd=(cmake -S "$dir" -B "$build_abs" -DCMAKE_BUILD_TYPE=Debug)
 	if [[ "$kind" == "asan" ]]; then
-		cmake_cmd+=(
-			-DCMAKE_C_FLAGS="-fsanitize=address -fno-omit-frame-pointer"
-			-DCMAKE_CXX_FLAGS="-fsanitize=address -fno-omit-frame-pointer"
-		)
+		cmake_cmd+=(-DCMAKE_C_FLAGS="-fsanitize=address -fno-omit-frame-pointer" -DCMAKE_CXX_FLAGS="-fsanitize=address -fno-omit-frame-pointer")
 	else
-		cmake_cmd+=(
-			-DCMAKE_C_FLAGS="-fsanitize=thread -fno-omit-frame-pointer"
-			-DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer"
-		)
+		cmake_cmd+=(-DCMAKE_C_FLAGS="-fsanitize=thread -fno-omit-frame-pointer" -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer")
 	fi
-
-	# User / default options AFTER sanitizer flags → can override
 	if [[ -n "$cmake_opts" ]]; then
 		# shellcheck disable=SC2206
 		cmake_extra=($cmake_opts)
 		cmake_cmd+=("${cmake_extra[@]}")
 	fi
 
-	if [[ "$verbose" -eq 1 ]]; then
-		printStep "Configuring ${kind^^}"
-		echo
-		if ! "${cmake_cmd[@]}"; then
-			printFail
-			err "cmake configure failed"
-			LAST_COUNT=0
-			return 0
-		fi
-		printOK
-	else
-		printStep "Configuring ${kind^^}"
-		if "${cmake_cmd[@]}" >/dev/null 2>&1; then
-			printOK
-		else
-			printFail
-			err "cmake configure failed"
-			LAST_COUNT=0
-			return 0
-		fi
+	info "Configure" "cmake"
+	if ! "${cmake_cmd[@]}" >"$out_file" 2>&1; then
+		err "cmake configure failed — see $out_file"
+		LAST_COUNT=0
+		return 0
 	fi
-
-	# -----------------------------------------------------------------
-	# 2. Compile
-	# -----------------------------------------------------------------
-	if [[ "$verbose" -eq 1 ]]; then
-		printStep "Compiling ${kind^^}"
-		echo
-		if ! cmake --build "$build_abs" -j"$(nproc)"; then
-			printFail
-			err "cmake build failed"
-			LAST_COUNT=0
-			return 0
-		fi
-		printOK
-	else
-		printStep "Compiling ${kind^^}"
-		if cmake --build "$build_abs" -j"$(nproc)" >/dev/null 2>&1; then
-			printOK
-		else
-			printFail
-			err "cmake build failed"
-			LAST_COUNT=0
-			return 0
-		fi
+	info "Build" "cmake --build"
+	if ! cmake --build "$build_abs" -j"$(nproc 2>/dev/null || echo 4)" >>"$out_file" 2>&1; then
+		err "cmake build failed — see $out_file"
+		LAST_COUNT=0
+		return 0
 	fi
-
-	# -----------------------------------------------------------------
-	# 3. Run
-	# -----------------------------------------------------------------
-	tmp_out="$(mktemp)"
 
 	if [[ "$kind" == "asan" ]]; then
 		export ASAN_OPTIONS="$asan_opts"
-		info "ASAN_OPTIONS" "$ASAN_OPTIONS"
 	else
 		export TSAN_OPTIONS="$tsan_opts"
-		info "TSAN_OPTIONS" "$TSAN_OPTIONS"
 	fi
-
-	printStep "Running tests"
 
 	if [[ -n "$executable" ]]; then
-		local exe_path
-		if [[ "$executable" == /* ]]; then
-			exe_path="$executable"
-		else
-			exe_path="$build_abs/$executable"
+		info "Run" "$executable"
+		if ! (cd "$dir" && "$executable") >>"$out_file" 2>&1; then
+			rc=1
 		fi
-		if [[ ! -x "$exe_path" ]]; then
-			printFail
-			err "Executable not found or not executable: $exe_path"
-			rm -f "$tmp_out"
-			LAST_COUNT=0
-			return 0
-		fi
-		"$exe_path" >"$tmp_out" 2>&1 || rc=$?
 	else
-		local -a ctest_cmd=(ctest --test-dir "$test_abs" --output-on-failure)
+		ctest_cmd=(ctest --test-dir "$test_abs" --output-on-failure)
+		[[ "$verbose" -eq 1 ]] && ctest_cmd+=(-V)
 		[[ -n "$test_regex" ]] && ctest_cmd+=(-R "$test_regex")
-		"${ctest_cmd[@]}" >"$tmp_out" 2>&1 || rc=$?
+		info "Run" "ctest"
+		if ! "${ctest_cmd[@]}" >>"$out_file" 2>&1; then
+			rc=1
+		fi
 	fi
 
-	run_output="$(cat "$tmp_out")"
-	rm -f "$tmp_out"
-
-	if [[ $rc -eq 0 ]]; then
-		printOK
-		ok "No errors — report not generated"
+	if [[ "$rc" -eq 0 ]]; then
+		ok "${kind^^} tests passed — report $out_file"
 		LAST_COUNT=1
 	else
-		printFail
-		printf '%s\n' "$run_output" > "$out_file"
-		err "Report generated because of error → $out_file"
+		err "${kind^^} tests failed — report $out_file"
 		LAST_COUNT=0
 	fi
-	# trap fires on RETURN and removes $build_abs
 }
 
-# -----------------------------------------------------------------------------
-# Main
-# -----------------------------------------------------------------------------
+# =============================================================================
+# main
+# =============================================================================
 
 main() {
+	local cmd="${1:-}"
+	shift || true
+
 	display_header
-
-	load_or_create_config
-
-	if [[ $# -lt 1 ]]; then
+	if [[ -z "$cmd" || "$cmd" == "help" || "$cmd" == "-h" || "$cmd" == "--help" ]]; then
 		display_help
-		exit 0
+		return 0
 	fi
 
-	local cmd="$1"
-	shift
+	require_cmd git gh jq
+	load_or_create_config
+	gh_require
 
 	case "$cmd" in
-		help|-h|--help)
-			display_help
-			;;
-		cache)
-			[[ "$DRY_RUN" == "1" ]] && info "Mode" "DRY_RUN"
-			cmd_cache "$@"
-			;;
-		ci)
-			[[ "$DRY_RUN" == "1" ]] && info "Mode" "DRY_RUN"
-			cmd_ci "$@"
-			;;
-		submodules)
-			[[ "$DRY_RUN" == "1" ]] && info "Mode" "DRY_RUN"
-			cmd_submodules "$@"
-			;;
-		git)
-			[[ "$DRY_RUN" == "1" ]] && info "Mode" "DRY_RUN"
-			cmd_git "$@"
-			;;
-		repos)
-			cmd_repos "$@"
-			;;
-		clone-all)
-			[[ "$DRY_RUN" == "1" ]] && info "Mode" "DRY_RUN"
-			cmd_clone_all
-			;;
-		search)
-			cmd_search "$@"
-			;;
-		fork)
-			[[ "$DRY_RUN" == "1" ]] && info "Mode" "DRY_RUN"
-			cmd_fork "$@"
-			;;
-		test)
-			cmd_test "$@"
-			;;
-		*)
-			usage_error "Unknown command: $cmd" \
-				"help | cache | ci | submodules | git | repos | clone-all | search | fork | test"
-			;;
+		cache)      cmd_cache "$@" ;;
+		ci)         cmd_ci "$@" ;;
+		submodules) cmd_submodules "$@" ;;
+		git)        cmd_git "$@" ;;
+		repos)      cmd_repos "$@" ;;
+		clone-all)  cmd_clone_all ;;
+		search)     cmd_search "$@" ;;
+		fork)       cmd_fork "$@" ;;
+		test)       cmd_test "$@" ;;
+		*) usage_error "Unknown command: $cmd" \
+			"help | cache | ci | submodules | git | repos | clone-all | search | fork | test" ;;
 	esac
 }
 
