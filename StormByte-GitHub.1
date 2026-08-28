@@ -207,11 +207,76 @@ Initialize and checkout submodules recursively.
 .B submodules deinit\fR [\fIdir-spec\fR]
 Deinitialize all submodules.
 .TP
-.B submodules update\fR [\fIdir-spec\fR]
-Clean, fetch, update submodules to the remote tip and commit/push if necessary.
+.B submodules update\fR [\fIdir-spec\fR] [\fB--confirm\fR]
+Fetch first, then update
+.B root
+submodules listed in
+.IR .gitmodules
+(not nested modules).
 When no directory is specified the update is performed in dependency order
 (using a topological sort over
 .BR ROOT ).
+.RS
+.IP \(bu 2
+A submodule with
+.B branch=
+in
+.I .gitmodules
+tracks
+.BR origin/<branch>
+(typically
+.B master
+/
+.BR main ).
+.IP \(bu 2
+A pin that is an exact tag is advanced to the next ref in the
+.B same family
+(semver such as
+.B 2.0.0
+/
+.BR v3.4.9 ,
+or
+.BR REL_N_STABLE ).
+Unstable names (alpha, beta, rc, pre, MS, \ldots) are ignored.
+A tag that still names the same version but points at a new SHA is reported as
+.BR re-release .
+.IP \(bu 2
+A raw SHA pin is left unchanged. If that SHA is missing after fetch (force-push), the command
+.B fails
+for that repository.
+.IP \(bu 2
+If the next tag cannot be chosen uniquely, every tag and origin branch is listed and the user is asked which ref to pin.
+Empty input skips that module. Under
+.B --confirm
+or a non-TTY stdin the row is marked
+.B UNRESOLVED
+and is not changed.
+.IP \(bu 2
+Before any checkout, a table is printed:
+.BR MODULE ,
+.BR CURRENT ,
+.BR PLANNED
+.RB ( "No changes" ,
+.BR re-release ,
+the new ref, or
+.BR UNRESOLVED ).
+Without
+.B --confirm
+an interactive
+.B Apply this plan? [y/N]
+prompt follows when there is work to do.
+.B --confirm
+applies the plan with no prompts (unresolved rows skipped).
+.IP \(bu 2
+Nested submodules are then synchronised with
+.B git submodule update --init --recursive
+to the SHAs recorded by the (possibly updated) parent. They are not version-bumped on their own.
+.IP \(bu 2
+If the parent gitlinks change, a commit (and push, when configured by the helper) is created.
+Respects
+.BR DRY_RUN
+(plan only, no checkout).
+.RE
 .TP
 .B submodules list\fR [\fIdir-spec\fR]
 List submodule entries from
@@ -759,6 +824,9 @@ StormByte-GitHub ci start --failed
 # Git / submodules
 ROOT=~/Software StormByte-GitHub git sync
 StormByte-GitHub submodules update
+StormByte-GitHub submodules update database
+StormByte-GitHub submodules update database --confirm
+DRY_RUN=1 StormByte-GitHub submodules update
 StormByte-GitHub submodules list crypto
 
 # Search / dump
@@ -780,7 +848,7 @@ StormByte-GitHub test tsan crypto --test "Thread.*"
 Success
 .TP
 .B 1
-General error (invalid arguments, missing configuration, git/gh failure, CI red, aborted confirmation, sanitizer test failure, etc.)
+General error (invalid arguments, missing configuration, git/gh failure, CI red, aborted confirmation, sanitizer test failure, missing pinned SHA, etc.)
 
 .SH FILES
 .TP
@@ -795,6 +863,9 @@ Looked for first next to the script, then in
 .I git.sh
 Git-specific helpers. Same search path as
 .IR functions.sh .
+Pin-family tables for
+.B submodules update
+live here (append-only).
 
 .SH NOTES
 .IP \(bu 2

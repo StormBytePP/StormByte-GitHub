@@ -9,7 +9,7 @@ set -euo pipefail
 # -----------------------------------------------------------------------------
 readonly STORMBYTE_GITHUB_VERSION="1.0.0"
 readonly REQUIRE_STORMBYTE_FUNCTIONS="1.1.0"
-readonly REQUIRE_STORMBYTE_FUNCTIONS_GIT="1.1.0"
+readonly REQUIRE_STORMBYTE_FUNCTIONS_GIT="1.2.0"
 
 # -----------------------------------------------------------------------------
 # Locate and load libraries
@@ -326,9 +326,17 @@ ${_CLR_BOLD_CYAN}ci stop|start|restart|status${_CLR_RESET}  [dir-spec] [--failed
     Manage workflow runs.
     --failed   Only re-run failed/cancelled/timed_out runs
 
-${_CLR_BOLD_CYAN}submodules init|deinit|update|list${_CLR_RESET}  [dir-spec]
+${_CLR_BOLD_CYAN}submodules init|deinit|update|list${_CLR_RESET}  [dir-spec] [--confirm]
     Submodule operations (update respects dependency order).
-    list   Show name, path and URL from .gitmodules (or "none").
+    list    Show name, path and URL from .gitmodules (or "none").
+    update  Fetch first. branch= follows origin/<branch>.
+            A tagged pin moves to the next ref in the same family
+            (semver / REL_N_STABLE). A raw SHA is left alone; a missing
+            SHA is an error. If the next tag cannot be chosen, list every
+            ref and ask (skipped under --confirm or a non-TTY).
+            Prints a MODULE / CURRENT / PLANNED table before any checkout.
+            --confirm  no prompts; apply the plan (UNRESOLVED rows skipped).
+            Nested modules only sync to SHAs recorded by the parent.
 
 ${_CLR_BOLD_CYAN}submodules add${_CLR_RESET}  <dir> <URL> <path> --name <name>
     Add a submodule (no init/update after). --name anywhere; path relative, no '..'.
@@ -1251,70 +1259,245 @@ commit_submodules_if_needed() {
 	return 0
 }
 
+_sm_current_label() {
+	local kind="$1" label="$2" sha="$3"
+	local short="${sha:0:7}"
+	case "$kind" in
+		branch) printf '%s (%s)' "$label" "$short" ;;
+		tag)    printf '%s (%s)' "$label" "$short" ;;
+		*)      printf 'sha:%s' "$short" ;;
+	esac
+}
+
+_sm_prompt_ref() {
+	local abs="$1" pin="$2" reason="$3"
+	local name reply
+	warn "Cannot choose the next ref for pin '${pin}' (${reason})."
+	printf "  ${_CLR_DIM}Available refs:${_CLR_RESET}\n"
+	while IFS= read -r name; do
+		[[ -z "$name" ]] && continue
+		printf "    tag:%s\n" "$name"
+	done < <(git_list_tag_names "$abs" "refs/sb-gh/tags" | sort)
+	while IFS= read -r name; do
+		[[ -z "$name" ]] && continue
+		printf "    branch:%s\n" "$name"
+	done < <(git_list_tag_names "$abs" "refs/sb-gh/heads" | sort)
+	if [[ "${SM_CONFIRM:-0}" == "1" ]] || [[ ! -t 0 ]]; then
+		return 1
+	fi
+	printf "  Enter ref to pin (empty = skip): "
+	read -r reply || return 1
+	[[ -n "$reply" ]] || return 1
+	printf '%s\n' "$reply"
+}
+
 cmd_submodules_update_one() {
 	local dir="$1" repo="$2"
 	local stashed=0
-	local sm_name sm_path sm_url branch abs short
+	local sm_name sm_path sm_url abs short
+	local kind label sha planned planned_sha current_lbl
+	local n_upd=0 n_re=0 n_unres=0
+	local -a plan_name=() plan_path=() plan_cur=() plan_new=()
+	local -a plan_action=() plan_target=()
+	local -a shadow_repos=()
+	local i action target reply next next_rc cmp_sha
+
+	_sm_shadow_cleanup() {
+		local r
+		for r in "${shadow_repos[@]}"; do
+			git_shadow_delete "$r"
+		done
+	}
 
 	info "Path" "$dir"
+	info "Remote" "$repo"
 	LAST_COUNT=0
 
+	if [[ ! -f "$dir/.gitmodules" ]]; then
+		ok "No .gitmodules — nothing to update"
+		return 0
+	fi
+
+	if [[ "$DRY_RUN" != "1" ]]; then
+		if git_stash_if_dirty "$dir" "StormByte-GitHub auto-stash before submodules update"; then
+			stashed=1
+			ok "Parent changes stashed"
+		fi
+	fi
+
+	git -C "$dir" fetch origin --prune >/dev/null 2>&1 || true
+
+	while IFS=$'\t' read -r sm_name sm_path sm_url; do
+		[[ -z "$sm_name" || -z "$sm_path" ]] && continue
+		abs="$dir/$sm_path"
+		action="keep"
+		target=""
+		planned="No changes"
+
+		if [[ "$DRY_RUN" != "1" ]]; then
+			if ! git -C "$dir" submodule update --init -- "$sm_path" >/dev/null 2>&1; then
+				warn "init failed for $sm_path"
+				continue
+			fi
+		fi
+
+		if [[ ! -d "$abs" ]]; then
+			warn "missing work tree for $sm_path"
+			continue
+		fi
+
+		shadow_repos+=("$abs")
+		if ! git_shadow_fetch "$abs"; then
+			warn "shadow fetch failed for $sm_path"
+		fi
+
+		IFS=$'\t' read -r kind label sha < <(git_sm_classify "$dir" "$sm_name" "$abs")
+		current_lbl="$(_sm_current_label "$kind" "$label" "$sha")"
+
+		if [[ "$kind" == "sha" ]]; then
+			if [[ -n "$sha" ]] && ! git_object_exists "$abs" "$sha"; then
+				err "Pinned SHA ${sha:0:7} is missing in ${sm_name} (${sm_path})"
+				_sm_shadow_cleanup
+				if [[ "$stashed" -eq 1 ]]; then
+					git_stash_pop_safe "$dir" >/dev/null 2>&1 || true
+				fi
+				return 1
+			fi
+			planned="No changes"
+			action="keep"
+		elif [[ "$kind" == "branch" ]]; then
+			planned_sha="$(git_peel_ref "$abs" "refs/sb-gh/heads/${label}" 2>/dev/null || true)"
+			if [[ -z "$planned_sha" ]]; then
+				err "shadow origin/${label} missing for ${sm_name}"
+				_sm_shadow_cleanup
+				if [[ "$stashed" -eq 1 ]]; then
+					git_stash_pop_safe "$dir" >/dev/null 2>&1 || true
+				fi
+				return 1
+			fi
+			if [[ "$planned_sha" == "$sha" ]]; then
+				planned="No changes"
+				action="keep"
+			else
+				planned="${label} (${planned_sha:0:7})"
+				action="branch"
+				target="$label"
+				n_upd=$((n_upd + 1))
+			fi
+		else
+			if ! git_object_exists "$abs" "refs/sb-gh/tags/${label}" \
+				&& ! git_object_exists "$abs" "refs/tags/${label}" \
+				&& ! git_object_exists "$abs" "$label"; then
+				err "Pinned tag '${label}' is missing in ${sm_name} (${sm_path})"
+				_sm_shadow_cleanup
+				if [[ "$stashed" -eq 1 ]]; then
+					git_stash_pop_safe "$dir" >/dev/null 2>&1 || true
+				fi
+				return 1
+			fi
+			next_rc=0
+			next="$(git_pin_next_in_family "$abs" "$label" "refs/sb-gh/tags")" || next_rc=$?
+			if (( next_rc != 0 )); then
+				reply="$(_sm_prompt_ref "$abs" "$label" "no unique successor in family")" || reply=""
+				if [[ -z "$reply" ]]; then
+					planned="UNRESOLVED"
+					action="skip"
+					n_unres=$((n_unres + 1))
+				else
+					planned="$reply"
+					action="tag"
+					target="$reply"
+					n_upd=$((n_upd + 1))
+				fi
+			elif [[ -z "$next" || "$next" == "$label" ]]; then
+				cmp_sha="$(git_peel_ref "$abs" "refs/sb-gh/tags/${label}" 2>/dev/null || true)"
+				if [[ -n "$cmp_sha" && -n "$sha" && "$cmp_sha" != "$sha" ]]; then
+					planned="re-release (${cmp_sha:0:7})"
+					action="tag"
+					target="$label"
+					n_re=$((n_re + 1))
+				else
+					planned="No changes"
+					action="keep"
+				fi
+			else
+				planned="$next"
+				action="tag"
+				target="$next"
+				n_upd=$((n_upd + 1))
+			fi
+		fi
+
+		plan_name+=("$sm_name")
+		plan_path+=("$sm_path")
+		plan_cur+=("$current_lbl")
+		plan_new+=("$planned")
+		plan_action+=("$action")
+		plan_target+=("$target")
+	done < <(git_gitmodules_list "$dir")
+
+	printf "  ${_CLR_DIM}%-36s  %-22s  %s${_CLR_RESET}\n" "MODULE" "CURRENT" "PLANNED"
+	for i in "${!plan_name[@]}"; do
+		printf "  %-36s  %-22s  %s\n" "${plan_name[$i]}" "${plan_cur[$i]}" "${plan_new[$i]}"
+	done
+
+	info "Plan" "${n_upd} update(s), ${n_re} re-release(s), ${n_unres} unresolved"
+	if [[ "${SM_CONFIRM:-0}" == "1" ]]; then
+		info "Mode" "--confirm"
+	fi
+
 	if [[ "$DRY_RUN" == "1" ]]; then
-		log "  [dry-run] root submodules: branch= → origin/<branch>; no branch= → keep pin"
-		log "  [dry-run] nested: submodule update --init --recursive (no --remote)"
-		if git_is_dirty "$dir"; then
-			LAST_COUNT=1
+		log "  [dry-run] no checkout"
+		LAST_COUNT=0
+		_sm_shadow_cleanup
+		if [[ "$stashed" -eq 1 ]]; then
+			git_stash_pop_safe "$dir" >/dev/null 2>&1 || true
 		fi
 		return 0
 	fi
 
-	if git_stash_if_dirty "$dir" "StormByte-GitHub auto-stash before submodules update"; then
-		stashed=1
-		ok "Parent changes stashed"
+	if [[ "${SM_CONFIRM:-0}" != "1" && -t 0 ]]; then
+		if (( n_upd + n_re > 0 )); then
+			printf "  Apply this plan? [y/N] "
+			read -r reply || reply=""
+			if [[ "${reply,,}" != "y" && "${reply,,}" != "yes" ]]; then
+				warn "Aborted"
+				_sm_shadow_cleanup
+				if [[ "$stashed" -eq 1 ]]; then
+					git_stash_pop_safe "$dir" >/dev/null 2>&1 || true
+				fi
+				return 0
+			fi
+		fi
 	fi
 
-	if [[ -f "$dir/.gitmodules" ]]; then
-		while IFS=$'\t' read -r sm_name sm_path sm_url; do
-			[[ -z "$sm_name" || -z "$sm_path" ]] && continue
-			abs="$dir/$sm_path"
-			branch="$(git -C "$dir" config -f .gitmodules --get "submodule.${sm_name}.branch" 2>/dev/null || true)"
-
-			if ! git -C "$dir" submodule update --init -- "$sm_path" >/dev/null 2>&1; then
-				warn "  init failed for $sm_path"
+	for i in "${!plan_name[@]}"; do
+		action="${plan_action[$i]}"
+		target="${plan_target[$i]}"
+		abs="$dir/${plan_path[$i]}"
+		[[ "$action" == "keep" || "$action" == "skip" ]] && continue
+		if [[ "$action" == "branch" ]]; then
+			git -C "$abs" fetch origin --prune >/dev/null 2>&1 || true
+			if ! git -C "$abs" checkout -B "$target" "origin/${target}" >/dev/null 2>&1; then
+				warn "checkout origin/${target} failed for ${plan_name[$i]}"
 				continue
 			fi
-
-			if [[ -n "$branch" ]]; then
-				log "  root '${sm_name}' (${sm_path}): track origin/${branch}"
-				if ! git -C "$abs" fetch origin >/dev/null 2>&1; then
-					warn "  fetch failed for $sm_path"
-					continue
-				fi
-				if ! git -C "$abs" rev-parse --verify "origin/${branch}" >/dev/null 2>&1; then
-					warn "  origin/${branch} missing after fetch for $sm_path"
-					continue
-				fi
-				if ! git -C "$abs" checkout -B "$branch" "origin/${branch}" >/dev/null 2>&1; then
-					warn "  checkout origin/${branch} failed for $sm_path"
-					continue
-				fi
-				short="$(git -C "$abs" rev-parse --short HEAD 2>/dev/null || echo "?")"
-				ok "  ${sm_name} → ${short} (origin/${branch})"
-			else
-				log "  root '${sm_name}' (${sm_path}): pinned (no branch= in .gitmodules)"
-				git -C "$abs" fetch --tags --force origin >/dev/null 2>&1 || true
-				git -C "$dir" submodule update --init -- "$sm_path" >/dev/null 2>&1 || true
-				short="$(git -C "$abs" rev-parse --short HEAD 2>/dev/null || echo "?")"
-				ok "  ${sm_name} at pinned ${short}"
-			fi
-		done < <(git_gitmodules_list "$dir")
-
-		log "  nested: update --init --recursive (pins from parent commits)"
-		if git -C "$dir" submodule update --init --recursive >/dev/null 2>&1; then
-			ok "  nested submodules synchronized to recorded SHAs"
 		else
-			warn "  nested submodule update had errors (pins may be incomplete)"
+			git -C "$abs" fetch origin --tags --prune >/dev/null 2>&1 || true
+			if ! git -C "$abs" checkout --detach "$target" >/dev/null 2>&1; then
+				warn "checkout ${target} failed for ${plan_name[$i]}"
+				continue
+			fi
 		fi
+		short="$(git -C "$abs" rev-parse --short HEAD 2>/dev/null || echo "?")"
+		ok "${plan_name[$i]} → ${short} (${plan_new[$i]})"
+	done
+
+	info "Nested" "synchronized to recorded SHAs"
+	if git -C "$dir" submodule update --init --recursive >/dev/null 2>&1; then
+		ok "Nested submodules synchronized to recorded SHAs"
+	else
+		warn "nested submodule update had errors (pins may be incomplete)"
 	fi
 
 	if commit_submodules_if_needed "$dir"; then
@@ -1322,6 +1505,8 @@ cmd_submodules_update_one() {
 	else
 		LAST_COUNT=0
 	fi
+
+	_sm_shadow_cleanup
 
 	if [[ "$stashed" -eq 1 ]]; then
 		log "  Restoring parent stash..."
@@ -1562,14 +1747,23 @@ cmd_submodules_delete() {
 cmd_submodules() {
 	local sub="${1:-}"
 	shift || true
-	local target="${1:-}"
-	local name dir repo
-	local -a ordered=()
+	local target=""
+	local name dir repo arg
+	local -a ordered=() rest=()
 
 	if [[ -z "$sub" ]]; then
 		usage_error "Missing submodules subcommand" \
-			"submodules init|deinit|update|list [dir-spec] | add … | delete …"
+			"submodules init|deinit|update|list [dir-spec] [--confirm] | add … | delete …"
 	fi
+
+	SM_CONFIRM=0
+	for arg in "$@"; do
+		case "$arg" in
+			--confirm) SM_CONFIRM=1 ;;
+			*) rest+=("$arg") ;;
+		esac
+	done
+	target="${rest[0]:-}"
 
 	case "$sub" in
 		init)
@@ -1623,7 +1817,7 @@ cmd_submodules() {
 			;;
 		*)
 			usage_error "Unknown submodules subcommand: $sub" \
-				"submodules init|deinit|update|list [dir-spec] | add … | delete …"
+				"submodules init|deinit|update|list [dir-spec] [--confirm] | add … | delete …"
 			;;
 	esac
 }

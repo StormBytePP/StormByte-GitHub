@@ -135,7 +135,8 @@ _StormByte_GitHub() {
 		((${#out[@]})) && printf '%s\n' "${out[@]}"
 	}
 
-	# Directory completion that behaves like bash "cd"
+	# Directory completion that behaves like bash "cd".
+	# Do not combine -S / with -o filenames: readline would append a second slash.
 	_sb_complete_path_dirs() {
 		local cur="$1"
 		local i p
@@ -145,7 +146,6 @@ _StormByte_GitHub() {
 		[[ "$cur" == "." ]] && cur="./"
 		[[ "$cur" == ".." ]] && cur="../"
 
-		compopt -o filenames 2>/dev/null
 		mapfile -t COMPREPLY < <(compgen -d -S / -- "$cur")
 
 		for i in "${!COMPREPLY[@]}"; do
@@ -153,10 +153,8 @@ _StormByte_GitHub() {
 			COMPREPLY[$i]="$p"
 		done
 
-		if ((${#COMPREPLY[@]} == 1)) && [[ "${COMPREPLY[0]}" == */ ]]; then
-			if compgen -d -- "${COMPREPLY[0]}" &>/dev/null; then
-				compopt -o nospace 2>/dev/null
-			fi
+		if ((${#COMPREPLY[@]} > 0)); then
+			compopt -o nospace 2>/dev/null
 		fi
 	}
 
@@ -242,7 +240,7 @@ _StormByte_GitHub() {
 		mapfile -t COMPREPLY < <(compgen -W "${candidates[*]}" -- "$cur")
 	}
 
-	# Relative path completion under a repository (like "cd")
+	# Relative path completion under a repository (same slash rule as _sb_complete_path_dirs)
 	_sb_complete_rel_path_under_repo() {
 		local cur="$1"
 		local repo_dir="$2"
@@ -250,8 +248,6 @@ _StormByte_GitHub() {
 
 		[[ -d "$repo_dir" ]] || return 0
 		cur="$(_sb_github_collapse_slashes "$cur")"
-
-		compopt -o filenames 2>/dev/null
 
 		mapfile -t COMPREPLY < <(
 			cd "$repo_dir" 2>/dev/null || exit 0
@@ -263,10 +259,8 @@ _StormByte_GitHub() {
 			COMPREPLY[$i]="$p"
 		done
 
-		if ((${#COMPREPLY[@]} == 1)) && [[ "${COMPREPLY[0]}" == */ ]]; then
-			if ( cd "$repo_dir" && compgen -d -- "${COMPREPLY[0]}" &>/dev/null ); then
-				compopt -o nospace 2>/dev/null
-			fi
+		if ((${#COMPREPLY[@]} > 0)); then
+			compopt -o nospace 2>/dev/null
 		fi
 	}
 
@@ -378,8 +372,19 @@ _StormByte_GitHub() {
 		fi
 		sub="${words[2]-}"
 		case "$sub" in
-		init | deinit | update | list)
+		init | deinit | list)
 			_sb_complete_repo_spec "$cur" "$SB_GH_ROOT"
+			return 0
+			;;
+		update)
+			if [[ "$cur" == -* ]]; then
+				mapfile -t COMPREPLY < <(compgen -W "--confirm" -- "$cur")
+				return 0
+			fi
+			_sb_complete_repo_spec "$cur" "$SB_GH_ROOT"
+			local -a extra=()
+			mapfile -t extra < <(compgen -W "--confirm" -- "$cur")
+			COMPREPLY+=("${extra[@]}")
 			return 0
 			;;
 		add)
