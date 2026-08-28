@@ -7,9 +7,9 @@ set -euo pipefail
 # -----------------------------------------------------------------------------
 # Version requirements
 # -----------------------------------------------------------------------------
-readonly STORMBYTE_GITHUB_VERSION="1.0.0"
-readonly REQUIRE_STORMBYTE_FUNCTIONS="1.1.0"
-readonly REQUIRE_STORMBYTE_FUNCTIONS_GIT="1.2.0"
+readonly STORMBYTE_GITHUB_VERSION="1.1.0"
+readonly REQUIRE_STORMBYTE_FUNCTIONS="1.3.0"
+readonly REQUIRE_STORMBYTE_FUNCTIONS_GIT="1.3.0"
 
 # -----------------------------------------------------------------------------
 # Locate and load libraries
@@ -75,20 +75,6 @@ prompt_config() {
 
 	default_root="/home/$(id -un 2>/dev/null || echo user)"
 
-	_normalize_path_input() {
-		local p="$1"
-		p="${p#"${p%%[![:space:]]*}"}"
-		p="${p%"${p##*[![:space:]]}"}"
-		case "$p" in
-			"~")   p="$HOME" ;;
-			"~/"*) p="$HOME/${p:2}" ;;
-		esac
-		while [[ "$p" == */ ]]; do
-			p="${p%/}"
-		done
-		printf '%s\n' "$p"
-	}
-
 	printf '  %s┌──────────────────────────────────────────────────────┐%s\n' "${_CLR_BOLD_BLUE}" "${_CLR_RESET}"
 	printf '  %s│%s  First-run configuration                             %s│%s\n' \
 		"${_CLR_BOLD_BLUE}" "${_CLR_RESET}" "${_CLR_BOLD_BLUE}" "${_CLR_RESET}"
@@ -125,7 +111,7 @@ prompt_config() {
 	printf '  %s└──────────────────────────────────────────────────────┘%s\n' "${_CLR_BOLD_CYAN}" "${_CLR_RESET}"
 	while true; do
 		read -e -r -p "  ROOT [${default_root}]: " input
-		input="$(_normalize_path_input "${input:-$default_root}")"
+		input="$(path_normalize "${input:-$default_root}")"
 		if [[ -d "$input" ]]; then
 			ROOT="$(cd "$input" && pwd)"
 			break
@@ -140,7 +126,7 @@ prompt_config() {
 	printf '  %s└──────────────────────────────────────────────────────┘%s\n' "${_CLR_BOLD_CYAN}" "${_CLR_RESET}"
 	while true; do
 		read -e -r -p "  OUT [/tmp]: " input
-		input="$(_normalize_path_input "${input:-/tmp}")"
+		input="$(path_normalize "${input:-/tmp}")"
 		if [[ -d "$input" ]]; then
 			OUT="$(cd "$input" && pwd)"
 			break
@@ -165,7 +151,7 @@ prompt_config() {
 			FORK_ROOT=""
 			break
 		fi
-		input="$(_normalize_path_input "$input")"
+		input="$(path_normalize "$input")"
 		if [[ -d "$input" ]]; then
 			FORK_ROOT="$(cd "$input" && pwd)"
 			break
@@ -285,7 +271,7 @@ OWNER       GitHub username
 ROOT        Working root directory (most commands)
 OUT         Output directory (repos dump)
 FORK_ROOT   Optional root used only by \"fork\" commands
-            (if unset, fork uses ROOT)
+			(if unset, fork uses ROOT)
 
 ${_CLR_BOLD}GLOBAL ENVIRONMENT${_CLR_RESET}
 DRY_RUN=1              Simulate actions without applying them
@@ -310,126 +296,140 @@ Notes:
 • The root is ROOT for most commands, and FORK_ROOT (or ROOT) for fork.
 • The argument is always a local directory (clone path), not the GitHub repo name.
 • When using ! exclusions from an interactive shell, quote them with single quotes
-  (e.g. '!multimedia') to avoid Bash history expansion.
+(e.g. '!multimedia') to avoid Bash history expansion.
 
 ${_CLR_BOLD}COMMANDS${_CLR_RESET}
 
 ${_CLR_BOLD_CYAN}help${_CLR_RESET}
-    Show this help.
+	Show this help.
 
 ${_CLR_BOLD_CYAN}cache show|list|delete${_CLR_RESET}  [dir-spec] [--name <pattern>]
-    Manage Actions caches.
-    --name <pattern>   Only affect caches whose key matches the glob
-                       (e.g. --name '*ccache*' or --name 'sccache-Windows-*')
+	Manage Actions caches.
+	--name <pattern>   Only affect caches whose key matches the glob
+					(e.g. --name '*ccache*' or --name 'sccache-Windows-*')
 
 ${_CLR_BOLD_CYAN}ci stop|start|restart|status${_CLR_RESET}  [dir-spec] [--failed]
-    Manage workflow runs.
-    --failed   Only re-run failed/cancelled/timed_out runs
+	Manage workflow runs.
+	--failed   Only re-run failed/cancelled/timed_out runs
 
 ${_CLR_BOLD_CYAN}submodules init|deinit|update|list${_CLR_RESET}  [dir-spec] [--confirm]
-    Submodule operations (update respects dependency order).
-    list    Show name, path and URL from .gitmodules (or "none").
-    update  Fetch first. branch= follows origin/<branch>.
-            A tagged pin moves to the next ref in the same family
-            (semver / REL_N_STABLE). A raw SHA is left alone; a missing
-            SHA is an error. If the next tag cannot be chosen, list every
-            ref and ask (skipped under --confirm or a non-TTY).
-            Prints a MODULE / CURRENT / PLANNED table before any checkout.
-            --confirm  no prompts; apply the plan (UNRESOLVED rows skipped).
-            Nested modules only sync to SHAs recorded by the parent.
+	Submodule operations (update walks ROOT in dependency order).
+	init    git submodule update --init --recursive
+	deinit  git submodule deinit --all -f
+	list    name, path and URL from .gitmodules (or "none").
+	update  First-level modules only; nested ones stay on the SHAs
+			recorded by their parent after the roots are staged.
+
+			Policy (branch= in .gitmodules of the parent):
+			A  branch=master
+				Float to origin/master. Already at that SHA → No changes.
+			B1 no master, checkout is a recognised release tag
+				Move to the latest tag in the same family (same prefix and
+				grain: postgres REL_<major>, Crypto++ CRYPTOPP_<X.Y>,
+				own libs X.Y). Same tag, different SHA → re-release.
+			B2 no master, checkout is not a tag (e.g. master was removed)
+				Pin to the latest tag of the inferred family (intentional
+				downgrade is allowed). Else the newest recognised release.
+			Unrecognised pins → UNRESOLVED. On a TTY you can type a ref;
+			--confirm / non-TTY skips those rows.
+
+			Prints MODULE / CURRENT / PLANNED, then asks [y/N] unless
+			--confirm or DRY_RUN=1. Parent dirty tree is stashed and restored.
+			Commits "chore: update dependencies" locally (no push).
 
 ${_CLR_BOLD_CYAN}submodules add${_CLR_RESET}  <dir> <URL> <path> --name <name>
-    Add a submodule (no init/update after). --name anywhere; path relative, no '..'.
+	Add a submodule (no init/update after). --name anywhere; path relative, no '..'.
 
 ${_CLR_BOLD_CYAN}submodules delete${_CLR_RESET}  <dir> (--name <name> | --url <url> | --path <path>)
-    Remove submodule + delete folder. Exactly one selector. No commit/push.
+	Remove submodule + delete folder. Exactly one selector. No commit/push.
 
 ${_CLR_BOLD_CYAN}git reset|pull|sync${_CLR_RESET}  [dir-spec]
-    git reset   → hard reset + clean
-    git pull    → fetch + pull --rebase
-    git sync    → alias for pull (no submodules)
+	git reset   → hard reset + clean (submodules reset + update --init)
+	git pull    → fetch + pull --rebase --no-recurse-submodules,
+				then nested modules sync to recorded SHAs
+	git sync    → alias for pull (does not re-pin first-level modules)
 
 ${_CLR_BOLD_CYAN}repos list${_CLR_RESET}
-    List non-recursive folders under \$ROOT showing:
-    folder name, remote repo, latest tag (or commit hash), current branch.
+	List non-recursive folders under \$ROOT showing:
+	folder name, remote repo, latest tag (or commit hash), current branch.
 
 ${_CLR_BOLD_CYAN}repos dump${_CLR_RESET}  <directory> [chunk_size_kb] [type=c++|type=cmake]
-    Dump sources into \$OUT.
+	Dump sources into \$OUT.
 
 ${_CLR_BOLD_CYAN}repos status${_CLR_RESET}  [dir-spec]
-    Working tree + upstream: OK, DIRTY, UNPUSHED, or DIRTY+UNPUSHED.
+	Working tree + upstream: OK, DIRTY, UNPUSHED, or DIRTY+UNPUSHED.
 
 ${_CLR_BOLD_CYAN}repos push${_CLR_RESET}  [dir-spec]
-    git push (no --force). Skips if no upstream. DRY_RUN supported.
+	git push (no --force). Skips if no upstream. DRY_RUN supported.
 
 ${_CLR_BOLD_CYAN}repos release${_CLR_RESET}  [dir-spec] [version] [--list | --delete | --skip-ci]
-    Manage version tags and GitHub Releases for OWNER repositories.
+	Manage version tags and GitHub Releases for OWNER repositories.
 
-    ${_CLR_BOLD}--list${_CLR_RESET} (dir and version optional)
-      List GitHub Releases (not plain tags).
-      Directory selection works like other commands (all under ROOT, one dir,
-      or !exclusions). If <version> is given, only that release is shown.
-      Tags that exist without a matching GitHub Release are reported as a
-      friendly note (not an error).
-      Positional parsing when --list is present:
-        (none)              → all repos, all releases
-        <dir-spec>          → selected repos, all releases
-        <version>           → all repos, that version only (SEMVER-shaped)
-        <dir-spec> <version>→ selected repos, that version only
+	${_CLR_BOLD}--list${_CLR_RESET} (dir and version optional)
+	List GitHub Releases (not plain tags).
+	Directory selection works like other commands (all under ROOT, one dir,
+	or !exclusions). If <version> is given, only that release is shown.
+	Tags that exist without a matching GitHub Release are reported as a
+	friendly note (not an error).
+	Positional parsing when --list is present:
+		(none)              → all repos, all releases
+		<dir-spec>          → selected repos, all releases
+		<version>           → all repos, that version only (SEMVER-shaped)
+		<dir-spec> <version>→ selected repos, that version only
 
-    ${_CLR_BOLD}--delete${_CLR_RESET}  <dir> <version>
-      Remove GitHub Release and tag (local + origin). Confirm with yes.
-      --skip-ci is ignored. No-op if neither exists.
+	${_CLR_BOLD}--delete${_CLR_RESET}  <dir> <version>
+	Remove GitHub Release and tag (local + origin). Confirm with yes.
+	--skip-ci is ignored. No-op if neither exists.
 
-    ${_CLR_BOLD}CREATE${_CLR_RESET} (default)  <dir> <version> [--skip-ci]
-      Tag, push and create a GitHub Release.
-      Requires clean tree on master/main, OWNER remote, and CHANGELOG.md with:
-        ## [<version>] - YYYY-MM-DD
-      Notes come from that section. Waits for CI unless --skip-ci
-      (Ctrl-C during wait: no tag yet). Same version recreates tag/release.
-      Pre-releases (e.g. 1.0.0-rc.1) use gh --prerelease.
-      Interactive confirmation (type yes). DRY_RUN supported for create/delete.
+	${_CLR_BOLD}CREATE${_CLR_RESET} (default)  <dir> <version> [--skip-ci]
+	Tag, push and create a GitHub Release.
+	Requires clean tree on master/main, OWNER remote, and CHANGELOG.md with:
+		## [<version>] - YYYY-MM-DD
+	Notes come from that section. Waits for CI unless --skip-ci
+	(Ctrl-C during wait: no tag yet). Same version recreates tag/release.
+	Pre-releases (e.g. 1.0.0-rc.1) use gh --prerelease.
+	Interactive confirmation (type yes). DRY_RUN supported for create/delete.
 
 ${_CLR_BOLD_CYAN}clone-all${_CLR_RESET}
-    Clone all public repositories of \$OWNER that are missing under \$ROOT.
+	Clone all public repositories of \$OWNER that are missing under \$ROOT.
 
 ${_CLR_BOLD_CYAN}search <text>${_CLR_RESET}  [dir-spec]
-    Search text in the code of the selected repositories.
+	Search text in the code of the selected repositories.
 
 ${_CLR_BOLD_CYAN}fork status|sync|branch-status${_CLR_RESET}  [dir-spec]
-    Uses FORK_ROOT if set, otherwise ROOT.
-    status         → behind/ahead vs upstream (forks)
-    sync           → update ONLY master if behind upstream
-    branch-status  → local branches ≠ master: CLEAN/CONFLICTS vs merge into master
-                     (merge-tree; NOTE: local-only if not pushed; neutral if none)
+	Uses FORK_ROOT if set, otherwise ROOT.
+	status         → behind/ahead vs upstream (forks)
+	sync           → update ONLY master if behind upstream
+	branch-status  → local branches ≠ master: CLEAN/CONFLICTS vs merge into master
+					(merge-tree; NOTE: local-only if not pushed; neutral if none)
 
 ${_CLR_BOLD_CYAN}test asan|tsan${_CLR_RESET}  [dir-spec]
-    Build and run AddressSanitizer / ThreadSanitizer tests.
-    Supports the same directory selection as other multi-repo commands
-    (all, one, or !exclusions). Relative paths resolve under \$ROOT;
-    absolute and ~/ paths are used as-is.
+	Build and run AddressSanitizer / ThreadSanitizer tests.
+	Supports the same directory selection as other multi-repo commands
+	(all, one, or !exclusions). Relative paths resolve under \$ROOT;
+	absolute and ~/ paths are used as-is.
 
-    The build directory is created by the script and always removed at the end
-    (success or failure). If the build directory already exists the command
-    aborts for safety for that repository.
+	The build directory is created by the script and always removed at the end
+	(success or failure). If the build directory already exists the command
+	aborts for safety for that repository.
 
-    Options:
-      --builddir DIR          Build directory relative to repo root
-                              (default: build-asan / build-tsan)
-      --testdir DIR           Directory for ctest (default: \$builddir/test)
-      --outfile FILE          Report file (default: /tmp/<repo>_asan|tsan_report.txt)
-                              Only written when an error occurs.
-      --cmake-options "opts"  Extra options passed to cmake (after sanitizer flags)
-      --executable PATH       Run this binary directly (relative to builddir or absolute)
-      --test REGEX            Run ctest -R REGEX instead of all tests
-      --asan-options "opts"   Extra ASAN_OPTIONS (only for asan)
-      --tsan-options "opts"   Extra TSAN_OPTIONS (only for tsan)
-      --verbose               Show full configure + compile output
+	Options:
+	--builddir DIR          Build directory relative to repo root
+							(default: build-asan / build-tsan)
+	--testdir DIR           Directory for ctest (default: \$builddir/test)
+	--outfile FILE          Report file (default: /tmp/<repo>_asan|tsan_report.txt)
+							Only written when an error occurs.
+	--cmake-options "opts"  Extra options passed to cmake (after sanitizer flags)
+	--executable PATH       Run this binary directly (relative to builddir or absolute)
+	--test REGEX            Run ctest -R REGEX instead of all tests
+	--asan-options "opts"   Extra ASAN_OPTIONS (only for asan)
+	--tsan-options "opts"   Extra TSAN_OPTIONS (only for tsan)
+	--verbose               Show full configure + compile output
 
-    Execution priority (per repository):
-      1. --executable  → run the binary directly
-      2. --test        → ctest -R REGEX
-      3. (none)        → ctest (all tests)
+	Execution priority (per repository):
+	1. --executable  → run the binary directly
+	2. --test        → ctest -R REGEX
+	3. (none)        → ctest (all tests)
 
 ${_CLR_BOLD}EXAMPLES${_CLR_RESET}
 ${SCRIPT_NAME} cache delete '!multimedia'
@@ -470,6 +470,79 @@ usage_error() {
 	echo "Accepted: $2"
 	echo "Use '${SCRIPT_NAME} help' for full help."
 	exit 1
+}
+
+# -----------------------------------------------------------------------------
+# Status colours — coherent palette, not a rainbow
+#   dark green  (_CLR_GREEN)      idle / no work
+#   light green (_CLR_BOLD_GREEN) an update or action that did work
+#   yellow                        warnings
+#   red                           failures
+# Headers (section / display_header) stay as they are.
+# -----------------------------------------------------------------------------
+
+_clr_wrap() {
+	printf '%s%s%s' "$1" "$2" "${_CLR_RESET}"
+}
+
+_clr_planned() {
+	local text="$1"
+	local low="${text,,}"
+	case "$low" in
+		"no changes"|"keep")
+			_clr_wrap "${_CLR_GREEN}" "$text"
+			;;
+		unresolved*|missing*|error*)
+			_clr_wrap "${_CLR_BOLD_RED}" "$text"
+			;;
+		*)
+			_clr_wrap "${_CLR_BOLD_GREEN}" "$text"
+			;;
+	esac
+}
+
+_clr_status_label() {
+	local label="$1"
+	case "$label" in
+		OK)             _clr_wrap "${_CLR_GREEN}" "$label" ;;
+		DIRTY|UNPUSHED) _clr_wrap "${_CLR_BOLD_YELLOW}" "$label" ;;
+		DIRTY+UNPUSHED) _clr_wrap "${_CLR_BOLD_RED}" "$label" ;;
+		*)              printf '%s' "$label" ;;
+	esac
+}
+
+_clr_merge_label() {
+	local label="$1"
+	case "$label" in
+		CLEAN)     _clr_wrap "${_CLR_GREEN}" "$label" ;;
+		CONFLICTS) _clr_wrap "${_CLR_BOLD_RED}" "$label" ;;
+		*)         printf '%s' "$label" ;;
+	esac
+}
+
+_clr_ci_status() {
+	local status="$1"
+	case "${status,,}" in
+		completed)            _clr_wrap "${_CLR_GREEN}" "$status" ;;
+		in_progress|queued|pending|waiting|requested)
+			_clr_wrap "${_CLR_CYAN}" "$status" ;;
+		*)                    printf '%s' "$status" ;;
+	esac
+}
+
+_clr_ci_conclusion() {
+	local conclusion="$1"
+	case "${conclusion,,}" in
+		success)  _clr_wrap "${_CLR_GREEN}" "$conclusion" ;;
+		failure|cancelled|timed_out|startup_failure)
+			_clr_wrap "${_CLR_BOLD_RED}" "$conclusion" ;;
+		-)        printf '%s' "$conclusion" ;;
+		*)        _clr_wrap "${_CLR_BOLD_YELLOW}" "$conclusion" ;;
+	esac
+}
+
+_idle() {
+	printf "  ${_CLR_GREEN}OK${_CLR_RESET} ${_CLR_DIM}│${_CLR_RESET} %s\n" "$*"
 }
 
 # -----------------------------------------------------------------------------
@@ -619,7 +692,7 @@ cmd_cache_show_one() {
 	mapfile -t entries < <(_cache_list_rows "$repo")
 
 	if [[ ${#entries[@]} -eq 0 ]]; then
-		ok "No caches"
+		_idle "No caches"
 		LAST_COUNT=0
 		LAST_BYTES=0
 		return 0
@@ -644,7 +717,7 @@ cmd_cache_show_one() {
 	done
 
 	if [[ "$count" -eq 0 ]]; then
-		ok "No caches matched the filter"
+		_idle "No caches matched the filter"
 	else
 		info "Repo total" "$count cache(s), $(human_size "$bytes")"
 		ok "Listed $count cache(s)"
@@ -664,7 +737,7 @@ cmd_cache_list_one() {
 	mapfile -t entries < <(_cache_list_rows "$repo")
 
 	if [[ ${#entries[@]} -eq 0 ]]; then
-		ok "No caches"
+		_idle "No caches"
 		LAST_COUNT=0
 		LAST_BYTES=0
 		return 0
@@ -687,7 +760,7 @@ cmd_cache_list_one() {
 	done
 
 	if [[ "$count" -eq 0 ]]; then
-		ok "No caches matched the filter"
+		_idle "No caches matched the filter"
 	else
 		ok "$count cache(s), $(human_size "$bytes")"
 	fi
@@ -719,9 +792,9 @@ cmd_cache_delete_one() {
 		batch=${#entries[@]}
 		if [[ "$batch" -eq 0 ]]; then
 			if [[ "$page" -eq 1 ]]; then
-				ok "No caches"
+				_idle "No caches"
 			else
-				ok "No more caches"
+				_idle "No more caches"
 			fi
 			break
 		fi
@@ -878,7 +951,7 @@ cmd_ci_stop_one() {
 	done
 
 	if [[ ${#entries[@]} -eq 0 ]]; then
-		ok "No active runs on $branch"
+		_idle "No active runs on $branch"
 		return 0
 	fi
 
@@ -1013,7 +1086,7 @@ cmd_ci_status_one() {
 	)
 
 	if [[ ${#entries[@]} -eq 0 ]]; then
-		ok "No recent runs"
+		_idle "No recent runs"
 		return 0
 	fi
 
@@ -1027,7 +1100,7 @@ cmd_ci_status_one() {
 		rest="${rest#*$'\t'}"
 		workflow="${rest%%$'\t'*}"
 		title="${rest#*$'\t'}"
-		printf "  %-12s  %-12s  %-20s  %s\n" "$status" "$conclusion" "$workflow" "$title"
+		printf "  %-12s  %-12s  %-20s  %s\n" "$(_clr_ci_status "$status")" "$(_clr_ci_conclusion "$conclusion")" "$workflow" "$title"
 		LAST_COUNT=$((LAST_COUNT + 1))
 	done
 	ok "Listed recent runs"
@@ -1073,11 +1146,7 @@ cmd_ci() {
 # -----------------------------------------------------------------------------
 
 canonical_repo_id() {
-	local url="$1"
-	local id
-	id="$(printf '%s' "$url" | sed -E 's#\.git$##; s#.*[:/]([^/]+/[^/]+)$#\1#')"
-	[[ -z "$id" || "$id" != */* ]] && return 1
-	printf '%s\n' "${id,,}"
+	git_canonical_repo_id "$1"
 }
 
 urls_from_gitmodules_file() {
@@ -1097,7 +1166,7 @@ collect_dep_ids_from() {
 	while IFS= read -r -d '' file; do
 		while IFS= read -r url; do
 			[[ -z "$url" ]] && continue
-			id="$(canonical_repo_id "$url" 2>/dev/null)" || continue
+			id="$(git_canonical_repo_id "$url" 2>/dev/null)" || continue
 			printf '%s\n' "$id"
 		done < <(urls_from_gitmodules_file "$file")
 	done < <(find "$dir" -type f -name .gitmodules ! -path '*/.git/*' -print0 2>/dev/null)
@@ -1118,7 +1187,7 @@ build_update_order() {
 		if ! repo_disp="$(git_resolve_repo "$dir" "$OWNER" 2>/dev/null)"; then
 			continue
 		fi
-		if ! id="$(canonical_repo_id "https://github.com/${repo_disp}.git")"; then
+		if ! id="$(git_canonical_repo_id "https://github.com/${repo_disp}.git")"; then
 			continue
 		fi
 		name="$(basename "$dir")"
@@ -1178,7 +1247,7 @@ cmd_submodules_init_one() {
 
 	info "Path" "$dir"
 	if [[ ! -f "$dir/.gitmodules" ]]; then
-		ok "No .gitmodules — nothing to init"
+		_idle "No .gitmodules — nothing to init"
 		LAST_COUNT=0
 		return 0
 	fi
@@ -1203,7 +1272,7 @@ cmd_submodules_deinit_one() {
 
 	info "Path" "$dir"
 	if [[ ! -f "$dir/.gitmodules" ]]; then
-		ok "No .gitmodules — nothing to deinit"
+		_idle "No .gitmodules — nothing to deinit"
 		LAST_COUNT=0
 		return 0
 	fi
@@ -1229,7 +1298,7 @@ commit_submodules_if_needed() {
 	name="$(basename "$dir")"
 
 	if ! git_is_dirty "$dir"; then
-		ok "No changes"
+		_idle "No changes"
 		return 1
 	fi
 
@@ -1255,6 +1324,7 @@ commit_submodules_if_needed() {
 	return 0
 }
 
+# Prompt for a ref when the family engine cannot decide (UNRESOLVED).
 _sm_prompt_ref() {
 	local abs="$1" pin="$2" reason="$3"
 	local name reply
@@ -1263,167 +1333,16 @@ _sm_prompt_ref() {
 	while IFS= read -r name; do
 		[[ -z "$name" ]] && continue
 		printf "    tag:%s\n" "$name"
-	done < <(git_list_tag_names "$abs" "refs/sb-gh/tags" | sort)
+	done < <(git_list_tag_names "$abs" "${GIT_SHADOW_TAGS:-refs/sb-gh/tags}" | sort)
 	while IFS= read -r name; do
 		[[ -z "$name" ]] && continue
 		printf "    branch:%s\n" "$name"
-	done < <(git_list_tag_names "$abs" "refs/sb-gh/heads" | sort)
-	if [[ "${SM_CONFIRM:-0}" == "1" ]] || [[ ! -t 0 ]]; then
+	done < <(git_list_tag_names "$abs" "${GIT_SHADOW_HEADS:-refs/sb-gh/heads}" | sort)
+	if [[ "${SM_CONFIRM:-0}" == "1" ]]; then
 		return 1
 	fi
-	printf "  Enter ref to pin (empty = skip): "
-	read -r reply || return 1
-	[[ -n "$reply" ]] || return 1
+	reply="$(prompt_line "Enter ref to pin (empty = skip):")" || return 1
 	printf '%s\n' "$reply"
-}
-
-_sm_emit_plan() {
-	printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-		"${1}" "${2}" "${3:--}" "${4:-0}" "${5:-0}" "${6:-0}"
-}
-
-_sm_gitmodules_branch() {
-	local dir="$1" sm_name="$2" sm_path="$3"
-	local b key path
-
-	b="$(git -C "$dir" config -f .gitmodules --get "submodule.${sm_name}.branch" 2>/dev/null || true)"
-	if [[ -n "$b" ]]; then
-		printf '%s\n' "$b"
-		return 0
-	fi
-	while IFS= read -r key; do
-		[[ "$key" == *.path ]] || continue
-		path="$(git -C "$dir" config -f .gitmodules --get "$key" 2>/dev/null || true)"
-		if [[ "$path" == "$sm_path" ]]; then
-			b="$(git -C "$dir" config -f .gitmodules --get "${key%.path}.branch" 2>/dev/null || true)"
-			if [[ -n "$b" ]]; then
-				printf '%s\n' "$b"
-				return 0
-			fi
-		fi
-	done < <(git -C "$dir" config -f .gitmodules --name-only --get-regexp '^submodule\..*\.path$' 2>/dev/null)
-	return 1
-}
-
-_sm_current_label() {
-	local kind="$1" label="$2" sha="$3"
-	local short="${sha:0:7}"
-	case "$kind" in
-		branch) printf '%s (%s)' "$label" "$short" ;;
-		tag)    printf '%s (%s)' "$label" "$short" ;;
-		*)      printf 'sha:%s' "$short" ;;
-	esac
-}
-
-_sm_tag_at_commit() {
-	local abs="$1" sha="$2"
-	local name peeled
-
-	[[ -n "$sha" ]] || return 1
-
-	name="$(git -C "$abs" describe --tags --exact-match "$sha" 2>/dev/null || true)"
-	if [[ -n "$name" ]]; then
-		printf '%s\n' "$name"
-		return 0
-	fi
-
-	name="$(git -C "$abs" tag --points-at "$sha" 2>/dev/null | head -n1 || true)"
-	if [[ -n "$name" ]]; then
-		printf '%s\n' "$name"
-		return 0
-	fi
-
-	while IFS= read -r name; do
-		[[ -z "$name" ]] && continue
-		peeled="$(git_peel_ref "$abs" "refs/sb-gh/tags/${name}" 2>/dev/null \
-			|| git_peel_ref "$abs" "refs/tags/${name}" 2>/dev/null \
-			|| true)"
-		if [[ -n "$peeled" && "$peeled" == "$sha" ]]; then
-			printf '%s\n' "$name"
-			return 0
-		fi
-	done < <(git_list_tag_names "$abs" "refs/sb-gh/tags" 2>/dev/null)
-
-	return 1
-}
-
-_sm_seed_tag_from_commit() {
-	local abs="$1" sha="$2"
-	local desc seed
-
-	desc="$(git -C "$abs" describe --tags --always "$sha" 2>/dev/null || true)"
-	[[ -n "$desc" ]] || return 1
-	if [[ "$desc" == *-*-g* ]]; then
-		seed="${desc%-*-g*}"
-		printf '%s\n' "$seed"
-		return 0
-	fi
-	if git_object_exists "$abs" "refs/sb-gh/tags/${desc}" \
-		|| git_object_exists "$abs" "refs/tags/${desc}"; then
-		printf '%s\n' "$desc"
-		return 0
-	fi
-	return 1
-}
-
-_sm_latest_in_family() {
-	local abs="$1" label="$2"
-	local next cur="$label" rc=0 guard=0
-
-	while (( guard++ < 64 )); do
-		rc=0
-		next="$(git_pin_next_in_family "$abs" "$cur" "refs/sb-gh/tags")" || rc=$?
-		if (( rc != 0 )); then
-			return 1
-		fi
-		if [[ -z "$next" || "$next" == "$cur" ]]; then
-			printf '%s\n' "$cur"
-			return 0
-		fi
-		cur="$next"
-	done
-	return 1
-}
-
-# stdout: planned \t action \t target \t n_upd \t n_re \t n_unres
-_sm_plan_tag() {
-	local abs="$1" label="$2" sha="$3"
-	local next next_rc=0 cmp_sha reply latest
-
-	if ! git_object_exists "$abs" "refs/sb-gh/tags/${label}" \
-		&& ! git_object_exists "$abs" "refs/tags/${label}" \
-		&& ! git_object_exists "$abs" "$label"; then
-		_sm_emit_plan "UNRESOLVED" "skip" "-" 0 0 1
-		return 0
-	fi
-
-	next_rc=0
-	next="$(git_pin_next_in_family "$abs" "$label" "refs/sb-gh/tags")" || next_rc=$?
-	if (( next_rc != 0 )); then
-		reply="$(_sm_prompt_ref "$abs" "$label" "no unique successor in family")" || reply=""
-		if [[ -z "$reply" ]]; then
-			_sm_emit_plan "UNRESOLVED" "skip" "-" 0 0 1
-		else
-			_sm_emit_plan "${reply}" "tag" "${reply}" 1 0 0
-		fi
-		return 0
-	fi
-
-	if [[ -n "$next" && "$next" != "$label" ]]; then
-		latest="$(_sm_latest_in_family "$abs" "$label" || printf '%s' "$next")"
-		_sm_emit_plan "${latest}" "tag" "${latest}" 1 0 0
-		return 0
-	fi
-
-	cmp_sha="$(git_peel_ref "$abs" "refs/sb-gh/tags/${label}" 2>/dev/null \
-		|| git_peel_ref "$abs" "refs/tags/${label}" 2>/dev/null \
-		|| true)"
-	if [[ -n "$cmp_sha" && -n "$sha" && "$cmp_sha" != "$sha" ]]; then
-		_sm_emit_plan "re-release (${cmp_sha:0:7})" "tag" "${label}" 0 1 0
-		return 0
-	fi
-
-	_sm_emit_plan "No changes" "keep" "-" 0 0 0
 }
 
 cmd_submodules_update_one() {
@@ -1435,7 +1354,7 @@ cmd_submodules_update_one() {
 	local -a plan_name=() plan_path=() plan_cur=() plan_new=()
 	local -a plan_action=() plan_target=()
 	local -a shadow_repos=()
-	local i action target reply gm_branch tag_at seed
+	local i action target reply gm_branch tag_at seed disp_tag
 	local plan_line d_upd d_re d_unres
 	local sha_new got
 
@@ -1494,7 +1413,7 @@ cmd_submodules_update_one() {
 		IFS=$'\t' read -r kind label sha < <(git_sm_classify "$dir" "$sm_name" "$abs")
 		gm_branch="$(_sm_gitmodules_branch "$dir" "$sm_name" "$sm_path" || true)"
 
-		# branch=master gana a "este SHA es una tag"
+		# Policy: branch=master wins over "this SHA is a tag"
 		if [[ "$gm_branch" == "master" ]]; then
 			kind="branch"
 			label="master"
@@ -1509,7 +1428,13 @@ cmd_submodules_update_one() {
 			fi
 		fi
 
-		current_lbl="$(_sm_current_label "$kind" "$label" "$sha")"
+		# CURRENT = what is pinned now, not the destination policy
+		disp_tag="$(_sm_tag_at_commit "$abs" "$sha" || true)"
+		if [[ -n "$disp_tag" ]]; then
+			current_lbl="$(_sm_current_label tag "$disp_tag" "$sha")"
+		else
+			current_lbl="$(_sm_current_label "$kind" "$label" "$sha")"
+		fi
 
 		if [[ "$kind" == "branch" ]]; then
 			planned_sha="$(git_peel_ref "$abs" "refs/sb-gh/heads/${label}" 2>/dev/null \
@@ -2302,16 +2227,16 @@ cmd_repos_status_one() {
 
 	if [[ "$dirty" -eq 1 && "$unpushed" -eq 1 ]]; then
 		status_label="DIRTY+UNPUSHED"
-		warn "Status $status_label"
+		warn "Status $(_clr_status_label "$status_label")"
 	elif [[ "$dirty" -eq 1 ]]; then
 		status_label="DIRTY"
-		warn "Status $status_label"
+		warn "Status $(_clr_status_label "$status_label")"
 	elif [[ "$unpushed" -eq 1 ]]; then
 		status_label="UNPUSHED"
-		warn "Status $status_label"
+		warn "Status $(_clr_status_label "$status_label")"
 	else
 		status_label="OK"
-		ok "Status $status_label"
+		_idle "Status $(_clr_status_label "$status_label")"
 	fi
 
 	LAST_COUNT=1
@@ -2881,7 +2806,7 @@ cmd_fork_status_one() {
 
 	if ! git_is_fork "$repo"; then
 		info "Fork" "no"
-		ok "Not a fork"
+		_idle "Not a fork"
 		LAST_COUNT=0
 		return 0
 	fi
@@ -2919,7 +2844,7 @@ cmd_fork_branch_status_one() {
 
 	if [[ ${#branches[@]} -eq 0 ]]; then
 		info "Branches" "no branches other than master"
-		ok "Nothing to check"
+		_idle "Nothing to check"
 		LAST_COUNT=0
 		return 0
 	fi
@@ -2952,7 +2877,7 @@ cmd_fork_branch_status_one() {
 			merge_label="CONFLICTS"
 		fi
 
-		printf "  %-36s  %-12s  %s\n" "$branch" "$merge_label" "$note"
+		printf "  %-36s  %-12s  %s\n" "$branch" "$(_clr_merge_label "$merge_label")" "$note"
 		count=$((count + 1))
 	done
 
@@ -2982,7 +2907,7 @@ cmd_fork_sync_one() {
 	fi
 
 	if [[ "$behind" -eq 0 ]]; then
-		ok "Already up to date with upstream (behind=$behind, ahead=$ahead) — skip"
+		_idle "Already up to date with upstream (behind=$behind, ahead=$ahead) — skip"
 		LAST_COUNT=0
 		return 0
 	fi

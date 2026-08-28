@@ -1,5 +1,5 @@
 # StormByte-GitHub.bash-completion
-# Bash completion for StormByte-GitHub
+# Bash completion for StormByte-GitHub 1.1.0
 #
 # Install as:
 #   /usr/share/bash-completion/completions/StormByte-GitHub
@@ -28,7 +28,7 @@ _StormByte_GitHub() {
 	fi
 
 	top_cmds=(
-		help
+		help -h --help
 		cache
 		ci
 		submodules
@@ -48,6 +48,15 @@ _StormByte_GitHub() {
 	fork_subs=(status sync branch-status)
 	test_subs=(asan tsan)
 	dump_extra=('type=c++' 'type=cmake' 50 100 200 500)
+
+	_sb_github_has_word() {
+		local needle="$1"
+		local i
+		for ((i = 1; i < cword; i++)); do
+			[[ "${words[i]}" == "$needle" ]] && return 0
+		done
+		return 1
+	}
 
 	_sb_github_collapse_slashes() {
 		local p="$1"
@@ -158,6 +167,16 @@ _StormByte_GitHub() {
 		fi
 	}
 
+	_sb_complete_path_files() {
+		local cur="$1"
+		cur="$(_sb_github_collapse_slashes "$cur")"
+		mapfile -t COMPREPLY < <(compgen -f -- "$cur")
+		if ((${#COMPREPLY[@]} == 1)) && [[ -d "${COMPREPLY[0]}" ]]; then
+			COMPREPLY[0]="${COMPREPLY[0]%/}/"
+			compopt -o nospace 2>/dev/null
+		fi
+	}
+
 	# ROOT: git-repo basenames
 	# PWD: every immediate subdirectory as ./name (relative path form)
 	_sb_github_repo_candidates() {
@@ -183,7 +202,6 @@ _StormByte_GitHub() {
 			|| "$cur" == "./" || "$cur" == "../" || "$cur" == "." || "$cur" == ".." ]]
 	}
 
-	# Single directory / repo (no dir-spec ! forms)
 	_sb_complete_single_repo() {
 		local cur="$1"
 		local root="$2"
@@ -196,7 +214,6 @@ _StormByte_GitHub() {
 		mapfile -t COMPREPLY < <(compgen -W "$(_sb_github_repo_candidates "$root")" -- "$cur")
 	}
 
-	# Multi dir-spec (includes !name / combinations)
 	_sb_complete_repo_spec() {
 		local cur="$1"
 		local root="$2"
@@ -215,7 +232,6 @@ _StormByte_GitHub() {
 				candidates+=("!$r")
 			done
 			if [[ "$cur" == *'+' ]]; then
-				# "!foo+" → "!foo+bar" / "!foo+!bar"  (not "!foo+!!bar")
 				for r in "${repos[@]}"; do
 					candidates+=("${cur}${r}")
 					candidates+=("${cur}!${r}")
@@ -240,7 +256,6 @@ _StormByte_GitHub() {
 		mapfile -t COMPREPLY < <(compgen -W "${candidates[*]}" -- "$cur")
 	}
 
-	# Relative path completion under a repository (same slash rule as _sb_complete_path_dirs)
 	_sb_complete_rel_path_under_repo() {
 		local cur="$1"
 		local repo_dir="$2"
@@ -276,7 +291,6 @@ _StormByte_GitHub() {
 			[[ -d "$w" ]] && printf '%s\n' "$(cd "$w" && pwd)"
 			return
 		fi
-		# Bare name: prefer ROOT, then PWD
 		if [[ -d "$root/$w" ]]; then
 			printf '%s\n' "$(cd "$root/$w" && pwd)"
 			return
@@ -297,6 +311,7 @@ _StormByte_GitHub() {
 		[[ -f "$changelog" ]] || return 0
 
 		while IFS= read -r line; do
+			[[ "$line" == *"Unreleased"* ]] && continue
 			if [[ "$line" =~ ^##[[:space:]]+\[v?([0-9]+)\.([0-9]+)\.([0-9]+)([0-9A-Za-z._-]*)\] ]]; then
 				ver="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}${BASH_REMATCH[4]}"
 				versions+=("$ver")
@@ -305,6 +320,22 @@ _StormByte_GitHub() {
 
 		((${#versions[@]})) || return 0
 		mapfile -t COMPREPLY < <(compgen -W "${versions[*]}" -- "$cur")
+	}
+
+	_sb_complete_submodule_names() {
+		local cur="$1"
+		local repo_dir="$2"
+		local names=()
+		local line name
+
+		[[ -n "$repo_dir" && -f "$repo_dir/.gitmodules" ]] || return 0
+		while IFS= read -r line; do
+			if [[ "$line" =~ ^[[:space:]]*\[submodule[[:space:]]+\"([^\"]+)\" ]]; then
+				names+=("${BASH_REMATCH[1]}")
+			fi
+		done < "$repo_dir/.gitmodules"
+		((${#names[@]})) || return 0
+		mapfile -t COMPREPLY < <(compgen -W "${names[*]}" -- "$cur")
 	}
 
 	_sb_github_load_roots
@@ -329,19 +360,21 @@ _StormByte_GitHub() {
 		sub="${words[2]-}"
 		case "$sub" in
 		show | list | delete)
-			# After --name / --name=… leave free text (globs like *apt*)
 			if [[ "$prev" == --name || "$cur" == --name=* ]]; then
 				return 0
 			fi
 			if [[ "$cur" == -* ]]; then
-				mapfile -t COMPREPLY < <(compgen -W "--name" -- "$cur")
+				if ! _sb_github_has_word --name; then
+					mapfile -t COMPREPLY < <(compgen -W "--name" -- "$cur")
+				fi
 				return 0
 			fi
-			# Positional: repo dir-spec; also suggest --name when it still fits
 			_sb_complete_repo_spec "$cur" "$SB_GH_ROOT"
-			local -a extra=()
-			mapfile -t extra < <(compgen -W "--name" -- "$cur")
-			COMPREPLY+=("${extra[@]}")
+			if ! _sb_github_has_word --name; then
+				local -a extra=()
+				mapfile -t extra < <(compgen -W "--name" -- "$cur")
+				COMPREPLY+=("${extra[@]}")
+			fi
 			;;
 		esac
 		return 0
@@ -354,12 +387,17 @@ _StormByte_GitHub() {
 		fi
 		sub="${words[2]-}"
 		case "$sub" in
-		stop | start | restart | status)
+		start | restart)
 			if [[ "$cur" == -* ]]; then
-				mapfile -t COMPREPLY < <(compgen -W "--failed" -- "$cur")
+				if ! _sb_github_has_word --failed; then
+					mapfile -t COMPREPLY < <(compgen -W "--failed" -- "$cur")
+				fi
 			else
 				_sb_complete_repo_spec "$cur" "$SB_GH_ROOT"
 			fi
+			;;
+		stop | status)
+			_sb_complete_repo_spec "$cur" "$SB_GH_ROOT"
 			;;
 		esac
 		return 0
@@ -378,13 +416,17 @@ _StormByte_GitHub() {
 			;;
 		update)
 			if [[ "$cur" == -* ]]; then
-				mapfile -t COMPREPLY < <(compgen -W "--confirm" -- "$cur")
+				if ! _sb_github_has_word --confirm; then
+					mapfile -t COMPREPLY < <(compgen -W "--confirm" -- "$cur")
+				fi
 				return 0
 			fi
 			_sb_complete_repo_spec "$cur" "$SB_GH_ROOT"
-			local -a extra=()
-			mapfile -t extra < <(compgen -W "--confirm" -- "$cur")
-			COMPREPLY+=("${extra[@]}")
+			if ! _sb_github_has_word --confirm; then
+				local -a extra=()
+				mapfile -t extra < <(compgen -W "--confirm" -- "$cur")
+				COMPREPLY+=("${extra[@]}")
+			fi
 			return 0
 			;;
 		add)
@@ -395,7 +437,9 @@ _StormByte_GitHub() {
 				return 0
 			fi
 			if [[ "$cur" == -* ]]; then
-				mapfile -t COMPREPLY < <(compgen -W "--name" -- "$cur")
+				if ! _sb_github_has_word --name && ! _sb_github_has_word --name=*; then
+					mapfile -t COMPREPLY < <(compgen -W "--name" -- "$cur")
+				fi
 				return 0
 			fi
 
@@ -464,7 +508,23 @@ _StormByte_GitHub() {
 				mapfile -t COMPREPLY < <(compgen -W "--name --url --path" -- "$cur")
 				return 0
 			fi
-			if [[ "$prev" == --name || "$prev" == --url ]]; then
+			if [[ "$prev" == --url ]]; then
+				return 0
+			fi
+			if [[ "$prev" == --name ]]; then
+				local i repo_dir=""
+				for ((i = 3; i < cword; i++)); do
+					case "${words[i]}" in
+						--name|--url|--path) ((i++)) ;;
+						--name=*|--url=*|--path=*) ;;
+						-*) ;;
+						*)
+							repo_dir="$(_sb_resolve_word_as_repo "${words[i]}" "$SB_GH_ROOT")"
+							[[ -n "$repo_dir" ]] && break
+							;;
+					esac
+				done
+				_sb_complete_submodule_names "$cur" "$repo_dir"
 				return 0
 			fi
 			if [[ "$prev" == --path ]]; then
@@ -561,9 +621,12 @@ _StormByte_GitHub() {
 			return 0
 			;;
 		release)
-			# Single repo only (no dir-spec ! forms)
 			if [[ "$cur" == -* ]]; then
-				mapfile -t COMPREPLY < <(compgen -W "--list --delete --skip-ci" -- "$cur")
+				local -a rel_flags=()
+				_sb_github_has_word --list    || rel_flags+=(--list)
+				_sb_github_has_word --delete  || rel_flags+=(--delete)
+				_sb_github_has_word --skip-ci || rel_flags+=(--skip-ci)
+				mapfile -t COMPREPLY < <(compgen -W "${rel_flags[*]}" -- "$cur")
 				return 0
 			fi
 
@@ -571,18 +634,19 @@ _StormByte_GitHub() {
 			local -a pos=()
 			for ((i = 3; i < cword; i++)); do
 				case "${words[i]}" in
-					--list)   have_list=1 ;;
-					--delete) have_delete=1 ;;
+					--list)    have_list=1 ;;
+					--delete)  have_delete=1 ;;
 					--skip-ci) ;;
 					-*) ;;
 					*) pos+=("${words[i]}") ;;
 				esac
 			done
 
+			# --list walks ROOT / dir-spec / !exclusions (same as foreach_repo)
 			if [[ "$have_list" -eq 1 ]]; then
 				case ${#pos[@]} in
 					0)
-						_sb_complete_single_repo "$cur" "$SB_GH_ROOT"
+						_sb_complete_repo_spec "$cur" "$SB_GH_ROOT"
 						;;
 					1)
 						local repo_dir=""
@@ -600,16 +664,20 @@ _StormByte_GitHub() {
 				return 0
 			fi
 
-			if ((cword == 3)) || [[ ${#pos[@]} -eq 0 ]]; then
+			# create / delete: first token is a single repo (not !spec)
+			if [[ ${#pos[@]} -eq 0 ]]; then
 				_sb_complete_single_repo "$cur" "$SB_GH_ROOT"
 				return 0
 			fi
 			if [[ ${#pos[@]} -eq 1 ]]; then
 				local repo_dir
+				local -a extra=()
 				repo_dir="$(_sb_resolve_word_as_repo "${pos[0]}" "$SB_GH_ROOT")"
 				if [[ -n "$repo_dir" ]]; then
 					_sb_complete_changelog_versions "$cur" "$repo_dir"
 				fi
+				mapfile -t extra < <(compgen -W "--list --delete --skip-ci" -- "$cur")
+				COMPREPLY+=("${extra[@]}")
 				return 0
 			fi
 			COMPREPLY=()
@@ -654,27 +722,30 @@ _StormByte_GitHub() {
 		case "$sub" in
 		asan | tsan)
 			if [[ "$cur" == -* ]]; then
-				local -a flags=(
-					--builddir
-					--testdir
-					--outfile
-					--cmake-options
-					--executable
-					--test
-					--verbose
-				)
+				local -a flags=()
+				_sb_github_has_word --builddir      || flags+=(--builddir)
+				_sb_github_has_word --testdir       || flags+=(--testdir)
+				_sb_github_has_word --outfile       || flags+=(--outfile)
+				_sb_github_has_word --cmake-options || flags+=(--cmake-options)
+				_sb_github_has_word --executable    || flags+=(--executable)
+				_sb_github_has_word --test          || flags+=(--test)
+				_sb_github_has_word --verbose       || flags+=(--verbose)
 				if [[ "$sub" == asan ]]; then
-					flags+=(--asan-options)
+					_sb_github_has_word --asan-options || flags+=(--asan-options)
 				else
-					flags+=(--tsan-options)
+					_sb_github_has_word --tsan-options || flags+=(--tsan-options)
 				fi
 				mapfile -t COMPREPLY < <(compgen -W "${flags[*]}" -- "$cur")
 				return 0
 			fi
 
 			case "$prev" in
-				--builddir|--testdir|--outfile|--executable)
+				--builddir|--testdir)
 					_sb_complete_path_dirs "$cur"
+					return 0
+					;;
+				--outfile|--executable)
+					_sb_complete_path_files "$cur"
 					return 0
 					;;
 				--cmake-options|--test|--asan-options|--tsan-options)
