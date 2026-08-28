@@ -1296,8 +1296,7 @@ cmd_submodules_update_one() {
 	local -a plan_name=() plan_path=() plan_cur=() plan_new=()
 	local -a plan_action=() plan_target=()
 	local -a shadow_repos=()
-	local i action target reply next next_rc cmp_sha
-	local _col_name _col_cur _col_new _clr_new
+	local i action target reply next next_rc cmp_sha gm_branch tag_at
 
 	_sm_shadow_cleanup() {
 		local r
@@ -1349,20 +1348,29 @@ cmd_submodules_update_one() {
 		fi
 
 		IFS=$'\t' read -r kind label sha < <(git_sm_classify "$dir" "$sm_name" "$abs")
+		gm_branch="$(git -C "$dir" config -f .gitmodules --get "submodule.${sm_name}.branch" 2>/dev/null || true)"
+
+		# branch=master → follow origin/master. Anything else → pin by tag.
+		if [[ "$gm_branch" == "master" ]]; then
+			kind="branch"
+			label="master"
+		elif [[ "$kind" != "tag" || -z "$label" ]]; then
+			tag_at="$(git -C "$abs" tag --points-at "${sha:-HEAD}" 2>/dev/null | head -n1 || true)"
+			if [[ -z "$tag_at" ]]; then
+				tag_at="$(git -C "$abs" describe --tags --exact-match "${sha:-HEAD}" 2>/dev/null || true)"
+			fi
+			if [[ -n "$tag_at" ]]; then
+				kind="tag"
+				label="$tag_at"
+			else
+				kind="sha"
+				label=""
+			fi
+		fi
+
 		current_lbl="$(_sm_current_label "$kind" "$label" "$sha")"
 
-		if [[ "$kind" == "sha" ]]; then
-			if [[ -n "$sha" ]] && ! git_object_exists "$abs" "$sha"; then
-				err "Pinned SHA ${sha:0:7} is missing in ${sm_name} (${sm_path})"
-				_sm_shadow_cleanup
-				if [[ "$stashed" -eq 1 ]]; then
-					git_stash_pop_safe "$dir" >/dev/null 2>&1 || true
-				fi
-				return 1
-			fi
-			planned="No changes"
-			action="keep"
-		elif [[ "$kind" == "branch" ]]; then
+		if [[ "$kind" == "branch" ]]; then
 			planned_sha="$(git_peel_ref "$abs" "refs/sb-gh/heads/${label}" 2>/dev/null || true)"
 			if [[ -z "$planned_sha" ]]; then
 				err "shadow origin/${label} missing for ${sm_name}"
@@ -1381,7 +1389,7 @@ cmd_submodules_update_one() {
 				target="$label"
 				n_upd=$((n_upd + 1))
 			fi
-		else
+		elif [[ "$kind" == "tag" ]]; then
 			if ! git_object_exists "$abs" "refs/sb-gh/tags/${label}" \
 				&& ! git_object_exists "$abs" "refs/tags/${label}" \
 				&& ! git_object_exists "$abs" "$label"; then
@@ -1423,6 +1431,10 @@ cmd_submodules_update_one() {
 				target="$next"
 				n_upd=$((n_upd + 1))
 			fi
+		else
+			planned="UNRESOLVED"
+			action="skip"
+			n_unres=$((n_unres + 1))
 		fi
 
 		plan_name+=("$sm_name")
@@ -1435,24 +1447,7 @@ cmd_submodules_update_one() {
 
 	printf "  ${_CLR_DIM}%-36s  %-22s  %s${_CLR_RESET}\n" "MODULE" "CURRENT" "PLANNED"
 	for i in "${!plan_name[@]}"; do
-		_col_name="$(printf '%-36s' "${plan_name[$i]}")"
-		_col_cur="$(printf '%-22s' "${plan_cur[$i]}")"
-		_col_new="${plan_new[$i]}"
-		case "${plan_action[$i]}" in
-			keep)
-				_clr_new="${_CLR_YELLOW}"
-				;;
-			skip)
-				_clr_new="${_CLR_BOLD_RED}"
-				;;
-			*)
-				_clr_new="${_CLR_BOLD_GREEN}"
-				;;
-		esac
-		printf "  %s%s%s  %s%s%s  %s%s%s\n" \
-			"${_CLR_WHITE}"     "$_col_name" "${_CLR_RESET}" \
-			"${_CLR_DIM}"       "$_col_cur"  "${_CLR_RESET}" \
-			"$_clr_new"         "$_col_new"  "${_CLR_RESET}"
+		printf "  %-36s  %-22s  %s\n" "${plan_name[$i]}" "${plan_cur[$i]}" "${plan_new[$i]}"
 	done
 
 	info "Plan" "${n_upd} update(s), ${n_re} re-release(s), ${n_unres} unresolved"
@@ -1497,38 +1492,22 @@ cmd_submodules_update_one() {
 				continue
 			fi
 		else
-			planned_sha="$(git_peel_ref "$abs" "refs/sb-gh/tags/${target}" 2>/dev/null || true)"
-			if [[ -z "$planned_sha" ]]; then
-				planned_sha="$(git_peel_ref "$abs" "$target" 2>/dev/null || true)"
-			fi
-			if [[ -z "$planned_sha" ]]; then
-				warn "cannot resolve ${target} for ${plan_name[$i]}"
+			git -C "$abs" fetch origin --tags --prune >/dev/null 2>&1 || true
+			if ! git -C "$abs" checkout --detach "$target" >/dev/null 2>&1; then
+				warn "checkout ${target} failed for ${plan_name[$i]}"
 				continue
 			fi
-			if ! git -C "$abs" checkout --detach "$planned_sha" >/dev/null 2>&1; then
-				warn "checkout ${target} (${planned_sha:0:7}) failed for ${plan_name[$i]}"
-				continue
-			fi
-		fi
-		if ! git -C "$dir" add -- "${plan_path[$i]}"; then
-			warn "git add ${plan_path[$i]} failed for ${plan_name[$i]}"
-			continue
 		fi
 		short="$(git -C "$abs" rev-parse --short HEAD 2>/dev/null || echo "?")"
 		ok "${plan_name[$i]} → ${short} (${plan_new[$i]})"
 	done
 
 	info "Nested" "synchronized to recorded SHAs"
-	for i in "${!plan_name[@]}"; do
-		[[ "${plan_action[$i]}" == "keep" || "${plan_action[$i]}" == "skip" ]] && continue
-		abs="$dir/${plan_path[$i]}"
-		[[ -f "$abs/.gitmodules" ]] || continue
-		if git -C "$abs" submodule update --init --recursive >/dev/null 2>&1; then
-			ok "Nested pins in ${plan_name[$i]}"
-		else
-			warn "nested update had errors in ${plan_name[$i]} (pins may be incomplete)"
-		fi
-	done
+	if git -C "$dir" submodule update --init --recursive >/dev/null 2>&1; then
+		ok "Nested submodules synchronized to recorded SHAs"
+	else
+		warn "nested submodule update had errors (pins may be incomplete)"
+	fi
 
 	if commit_submodules_if_needed "$dir"; then
 		LAST_COUNT=1
