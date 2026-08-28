@@ -1324,39 +1324,16 @@ commit_submodules_if_needed() {
 	return 0
 }
 
-# Prompt for a ref when the family engine cannot decide (UNRESOLVED).
-_sm_prompt_ref() {
-	local abs="$1" pin="$2" reason="$3"
-	local name reply
-	warn "Cannot choose the next ref for pin '${pin}' (${reason})."
-	printf "  ${_CLR_DIM}Available refs:${_CLR_RESET}\n"
-	while IFS= read -r name; do
-		[[ -z "$name" ]] && continue
-		printf "    tag:%s\n" "$name"
-	done < <(git_list_tag_names "$abs" "${GIT_SHADOW_TAGS:-refs/sb-gh/tags}" | sort)
-	while IFS= read -r name; do
-		[[ -z "$name" ]] && continue
-		printf "    branch:%s\n" "$name"
-	done < <(git_list_tag_names "$abs" "${GIT_SHADOW_HEADS:-refs/sb-gh/heads}" | sort)
-	if [[ "${SM_CONFIRM:-0}" == "1" ]]; then
-		return 1
-	fi
-	reply="$(prompt_line "Enter ref to pin (empty = skip):")" || return 1
-	printf '%s\n' "$reply"
-}
-
 cmd_submodules_update_one() {
 	local dir="$1" repo="$2"
 	local stashed=0
-	local sm_name sm_path sm_url abs short
-	local kind label sha planned planned_sha current_lbl
-	local n_upd=0 n_re=0 n_unres=0
+	local sm_name sm_path sm_url abs
+	local action kind current planned target sha sha_new
+	local n_upd=0 n_re=0 n_unres=0 n_err=0
 	local -a plan_name=() plan_path=() plan_cur=() plan_new=()
-	local -a plan_action=() plan_target=()
+	local -a plan_action=() plan_kind=() plan_target=()
 	local -a shadow_repos=()
-	local i action target reply gm_branch tag_at seed disp_tag
-	local plan_line d_upd d_re d_unres
-	local sha_new got
+	local i
 
 	_sm_shadow_cleanup() {
 		local r
@@ -1370,7 +1347,7 @@ cmd_submodules_update_one() {
 	LAST_COUNT=0
 
 	if [[ ! -f "$dir/.gitmodules" ]]; then
-		ok "No .gitmodules — nothing to update"
+		_idle "No .gitmodules — nothing to update"
 		return 0
 	fi
 
@@ -1386,10 +1363,6 @@ cmd_submodules_update_one() {
 	while IFS=$'\t' read -r sm_name sm_path sm_url; do
 		[[ -z "$sm_name" || -z "$sm_path" ]] && continue
 		abs="$dir/$sm_path"
-		action="keep"
-		target="-"
-		planned="No changes"
-		d_upd=0 d_re=0 d_unres=0
 
 		if [[ "$DRY_RUN" != "1" ]]; then
 			if ! git -C "$dir" submodule update --init -- "$sm_path" >/dev/null 2>&1; then
@@ -1397,169 +1370,89 @@ cmd_submodules_update_one() {
 				continue
 			fi
 		fi
-
 		if [[ ! -d "$abs" ]]; then
 			warn "missing work tree for $sm_path"
 			continue
 		fi
 
 		shadow_repos+=("$abs")
-		if ! git_shadow_fetch "$abs"; then
-			warn "shadow fetch failed for $sm_path"
-		fi
+		git_shadow_fetch "$abs" || warn "shadow fetch failed for $sm_path"
 		git -C "$abs" fetch origin --tags --force --prune >/dev/null 2>&1 || true
 		git -C "$abs" fetch origin master --prune >/dev/null 2>&1 || true
 
-		IFS=$'\t' read -r kind label sha < <(git_sm_classify "$dir" "$sm_name" "$abs")
-		gm_branch="$(_sm_gitmodules_branch "$dir" "$sm_name" "$sm_path" || true)"
+		IFS=$'\t' read -r action kind current planned target sha \
+			< <(git_sm_plan "$dir" "$sm_name" "$abs")
 
-		# Policy: branch=master wins over "this SHA is a tag"
-		if [[ "$gm_branch" == "master" ]]; then
-			kind="branch"
-			label="master"
-		else
-			tag_at="$(_sm_tag_at_commit "$abs" "$sha" || true)"
-			if [[ -n "$tag_at" ]]; then
-				kind="tag"
-				label="$tag_at"
-			else
-				kind="sha"
-				label=""
-			fi
-		fi
-
-		# CURRENT = what is pinned now, not the destination policy
-		disp_tag="$(_sm_tag_at_commit "$abs" "$sha" || true)"
-		if [[ -n "$disp_tag" ]]; then
-			current_lbl="$(_sm_current_label tag "$disp_tag" "$sha")"
-		else
-			current_lbl="$(_sm_current_label "$kind" "$label" "$sha")"
-		fi
-
-		if [[ "$kind" == "branch" ]]; then
-			planned_sha="$(git_peel_ref "$abs" "refs/sb-gh/heads/${label}" 2>/dev/null \
-				|| git -C "$abs" rev-parse "origin/${label}" 2>/dev/null \
-				|| true)"
-			if [[ -z "$planned_sha" ]]; then
-				err "origin/${label} missing for ${sm_name}"
-				_sm_shadow_cleanup
-				if [[ "$stashed" -eq 1 ]]; then
-					git_stash_pop_safe "$dir" >/dev/null 2>&1 || true
-				fi
-				return 1
-			fi
-			if [[ "$planned_sha" == "$sha" ]]; then
-				planned="No changes"
-				action="keep"
-				target="-"
-			else
-				planned="master (${planned_sha:0:7})"
-				action="branch"
-				target="$label"
-				n_upd=$((n_upd + 1))
-			fi
-		elif [[ "$kind" == "tag" ]]; then
-			plan_line="$(_sm_plan_tag "$abs" "$label" "$sha")"
-			IFS=$'\t' read -r planned action target d_upd d_re d_unres <<<"$plan_line"
-			n_upd=$((n_upd + d_upd))
-			n_re=$((n_re + d_re))
-			n_unres=$((n_unres + d_unres))
-		else
-			seed="$(_sm_seed_tag_from_commit "$abs" "$sha" || true)"
-			if [[ -z "$seed" ]]; then
-				seed="$(git_list_tag_names "$abs" "refs/sb-gh/tags" 2>/dev/null | sort -V | tail -n1 || true)"
-			fi
-			if [[ -n "$seed" ]]; then
-				current_lbl="$(_sm_current_label tag "$seed" "$sha")"
-				plan_line="$(_sm_plan_tag "$abs" "$seed" "$sha")"
-				IFS=$'\t' read -r planned action target d_upd d_re d_unres <<<"$plan_line"
-				n_upd=$((n_upd + d_upd))
-				n_re=$((n_re + d_re))
-				n_unres=$((n_unres + d_unres))
-			else
-				planned="No changes"
-				action="keep"
-				target="-"
-			fi
-		fi
+		case "$action" in
+			update)    n_upd=$((n_upd + 1)) ;;
+			rerelease) n_re=$((n_re + 1)) ;;
+			skip)      n_unres=$((n_unres + 1)) ;;
+			error)     n_err=$((n_err + 1)) ;;
+		esac
 
 		plan_name+=("$sm_name")
 		plan_path+=("$sm_path")
-		plan_cur+=("$current_lbl")
+		plan_cur+=("$current")
 		plan_new+=("$planned")
 		plan_action+=("$action")
+		plan_kind+=("$kind")
 		plan_target+=("$target")
 	done < <(git_gitmodules_list "$dir")
 
-	printf "  ${_CLR_DIM}%-36s  %-22s  %s${_CLR_RESET}\n" "MODULE" "CURRENT" "PLANNED"
+	print_columns --header MODULE CURRENT PLANNED
 	for i in "${!plan_name[@]}"; do
-		printf "  %-36s  %-22s  %s\n" "${plan_name[$i]}" "${plan_cur[$i]}" "${plan_new[$i]}"
+		print_columns "${plan_name[$i]}" "${plan_cur[$i]}" "$(_clr_planned "${plan_new[$i]}")"
 	done
 
-	info "Plan" "${n_upd} update(s), ${n_re} re-release(s), ${n_unres} unresolved"
-	if [[ "${SM_CONFIRM:-0}" == "1" ]]; then
-		info "Mode" "--confirm"
-	fi
+	info "Plan" "${n_upd} update(s), ${n_re} re-release(s), ${n_unres} unresolved, ${n_err} error(s)"
+	[[ "${SM_CONFIRM:-0}" == "1" ]] && info "Mode" "--confirm"
 
 	if [[ "$DRY_RUN" == "1" ]]; then
 		log "  [dry-run] no checkout"
 		LAST_COUNT=0
 		_sm_shadow_cleanup
-		if [[ "$stashed" -eq 1 ]]; then
-			git_stash_pop_safe "$dir" >/dev/null 2>&1 || true
-		fi
+		[[ "$stashed" -eq 1 ]] && git_stash_pop_safe "$dir" >/dev/null 2>&1 || true
 		return 0
 	fi
 
-	if [[ "${SM_CONFIRM:-0}" != "1" && -t 0 ]]; then
-		if (( n_upd + n_re > 0 )); then
-			printf "  Apply this plan? [y/N] "
-			read -r reply || reply=""
-			if [[ "${reply,,}" != "y" && "${reply,,}" != "yes" ]]; then
-				warn "Aborted"
-				_sm_shadow_cleanup
-				if [[ "$stashed" -eq 1 ]]; then
-					git_stash_pop_safe "$dir" >/dev/null 2>&1 || true
-				fi
-				return 0
-			fi
+	if (( n_upd + n_re > 0 )); then
+		if ! confirm_yes "Apply this plan?"; then
+			warn "Aborted"
+			_sm_shadow_cleanup
+			[[ "$stashed" -eq 1 ]] && git_stash_pop_safe "$dir" >/dev/null 2>&1 || true
+			return 0
 		fi
 	fi
 
 	for i in "${!plan_name[@]}"; do
 		action="${plan_action[$i]}"
+		kind="${plan_kind[$i]}"
 		target="${plan_target[$i]}"
 		abs="$dir/${plan_path[$i]}"
-		[[ "$action" == "keep" || "$action" == "skip" || "$target" == "-" ]] && continue
-		if [[ "$action" == "branch" ]]; then
-			git -C "$abs" fetch origin --prune >/dev/null 2>&1 || true
-			if ! git -C "$abs" checkout -B "$target" "origin/${target}" >/dev/null 2>&1; then
-				warn "checkout origin/${target} failed for ${plan_name[$i]}"
-				continue
-			fi
+		[[ "$action" == "keep" || "$action" == "skip" || -z "$target" ]] && continue
+		if [[ "$action" == "error" ]]; then
+			err "${plan_name[$i]}: ${plan_new[$i]}"
+			continue
+		fi
+
+		if [[ "$kind" == "branch" ]]; then
+			git_sm_checkout_branch "$abs" "$target" \
+				|| { warn "checkout origin/${target} failed for ${plan_name[$i]}"; continue; }
 		else
-			git -C "$abs" fetch origin --tags --force --prune >/dev/null 2>&1 || true
-			if ! git -C "$abs" checkout --detach "$target" >/dev/null 2>&1; then
-				warn "checkout ${target} failed for ${plan_name[$i]}"
-				continue
-			fi
+			git_sm_checkout_tag "$abs" "$target" \
+				|| { warn "checkout ${target} failed for ${plan_name[$i]}"; continue; }
 		fi
+
 		sha_new="$(git -C "$abs" rev-parse HEAD)"
-		if ! git -C "$dir" update-index --cacheinfo "160000,${sha_new},${plan_path[$i]}"; then
-			warn "update-index ${plan_path[$i]} failed for ${plan_name[$i]}"
+		if ! git_sm_stage_gitlink "$dir" "${plan_path[$i]}" "$sha_new"; then
+			err "gitlink not staged for ${plan_name[$i]}"
 			continue
 		fi
-		got="$(git -C "$dir" rev-parse ":${plan_path[$i]}" 2>/dev/null || true)"
-		if [[ "$got" != "$sha_new" ]]; then
-			err "gitlink not staged for ${plan_name[$i]} (want ${sha_new:0:7}, index ${got:0:7})"
-			continue
-		fi
-		short="$(git -C "$abs" rev-parse --short HEAD 2>/dev/null || echo "?")"
-		ok "${plan_name[$i]} → ${short} (${plan_new[$i]})"
+		ok "${plan_name[$i]} → $(git_head_sha "$abs") (${plan_new[$i]})"
 	done
 
 	info "Nested" "synchronized to recorded SHAs"
-	if git -C "$dir" submodule update --init --recursive >/dev/null 2>&1; then
+	if git_sm_update_nested "$dir" >/dev/null 2>&1; then
 		ok "Nested submodules synchronized to recorded SHAs"
 	else
 		warn "nested submodule update had errors (pins may be incomplete)"
@@ -1585,21 +1478,7 @@ cmd_submodules_update_one() {
 }
 
 _sb_resolve_single_repo_dir() {
-	local raw="$1"
-	local candidate
-
-	if [[ "$raw" == ~* ]]; then
-		raw="${raw/#\~/$HOME}"
-	fi
-	if [[ "$raw" == /* || "$raw" == ./* || "$raw" == ../* ]]; then
-		candidate="$raw"
-	else
-		candidate="${ROOT%/}/$raw"
-	fi
-	if [[ ! -d "$candidate" ]]; then
-		displayError "Not a directory: $1 (tried: $candidate)"
-	fi
-	(cd "$candidate" && pwd)
+	resolve_dir_under "$ROOT" "$1"
 }
 
 cmd_submodules_list_one() {
