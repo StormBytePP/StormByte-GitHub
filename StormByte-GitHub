@@ -1502,9 +1502,18 @@ cmd_submodules_update_one() {
 				continue
 			fi
 		else
-			git -C "$abs" fetch origin --tags --prune >/dev/null 2>&1 || true
-			if ! git -C "$abs" checkout --detach "$target" >/dev/null 2>&1; then
-				warn "checkout ${target} failed for ${plan_name[$i]}"
+			# Prefer the shadow peel so a re-release (same tag, new SHA) is honoured.
+			# `git fetch --tags` will not move an existing local tag without --force.
+			planned_sha="$(git_peel_ref "$abs" "refs/sb-gh/tags/${target}" 2>/dev/null || true)"
+			if [[ -z "$planned_sha" ]]; then
+				planned_sha="$(git_peel_ref "$abs" "$target" 2>/dev/null || true)"
+			fi
+			if [[ -z "$planned_sha" ]]; then
+				warn "cannot resolve ${target} for ${plan_name[$i]}"
+				continue
+			fi
+			if ! git -C "$abs" checkout --detach "$planned_sha" >/dev/null 2>&1; then
+				warn "checkout ${target} (${planned_sha:0:7}) failed for ${plan_name[$i]}"
 				continue
 			fi
 		fi
