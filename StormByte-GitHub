@@ -1274,13 +1274,11 @@ cmd_submodules_update_one() {
 	fi
 
 	if [[ -f "$dir/.gitmodules" ]]; then
-		# --- Root-level submodules only (paths listed in this repo's .gitmodules) ---
 		while IFS=$'\t' read -r sm_name sm_path sm_url; do
 			[[ -z "$sm_name" || -z "$sm_path" ]] && continue
 			abs="$dir/$sm_path"
 			branch="$(git -C "$dir" config -f .gitmodules --get "submodule.${sm_name}.branch" 2>/dev/null || true)"
 
-			# Ensure worktree exists (does not move a pin to remote)
 			if ! git -C "$dir" submodule update --init -- "$sm_path" >/dev/null 2>&1; then
 				warn "  init failed for $sm_path"
 				continue
@@ -1288,7 +1286,6 @@ cmd_submodules_update_one() {
 
 			if [[ -n "$branch" ]]; then
 				log "  root '${sm_name}' (${sm_path}): track origin/${branch}"
-				# Plain fetch — same command that works manually
 				if ! git -C "$abs" fetch origin >/dev/null 2>&1; then
 					warn "  fetch failed for $sm_path"
 					continue
@@ -1305,14 +1302,13 @@ cmd_submodules_update_one() {
 				ok "  ${sm_name} → ${short} (origin/${branch})"
 			else
 				log "  root '${sm_name}' (${sm_path}): pinned (no branch= in .gitmodules)"
-				# Recorded gitlink only — never --remote
-				git -C "$dir" submodule update -- "$sm_path" >/dev/null 2>&1 || true
+				git -C "$abs" fetch --tags --force origin >/dev/null 2>&1 || true
+				git -C "$dir" submodule update --init -- "$sm_path" >/dev/null 2>&1 || true
 				short="$(git -C "$abs" rev-parse --short HEAD 2>/dev/null || echo "?")"
 				ok "  ${sm_name} at pinned ${short}"
 			fi
 		done < <(git_gitmodules_list "$dir")
 
-		# --- Nested: respect SHAs recorded by each parent (do not float) ---
 		log "  nested: update --init --recursive (pins from parent commits)"
 		if git -C "$dir" submodule update --init --recursive >/dev/null 2>&1; then
 			ok "  nested submodules synchronized to recorded SHAs"
@@ -1641,10 +1637,13 @@ cmd_git_reset_one() {
 	info "Path" "$dir"
 	if [[ "$DRY_RUN" == "1" ]]; then
 		log "  [dry-run] would: git reset --hard && git clean -fd"
+		log "  [dry-run] would: submodule foreach reset --hard && submodule update --init"
 		LAST_COUNT=1
 		return 0
 	fi
 	if git -C "$dir" reset --hard && git -C "$dir" clean -fd; then
+		git -C "$dir" submodule foreach --recursive 'git reset --hard && git clean -fd' >/dev/null 2>&1 || true
+		git -C "$dir" submodule update --init --recursive >/dev/null 2>&1 || true
 		ok "Reset complete"
 		LAST_COUNT=1
 	else
@@ -1657,11 +1656,13 @@ cmd_git_pull_one() {
 	local dir="$1"
 	info "Path" "$dir"
 	if [[ "$DRY_RUN" == "1" ]]; then
-		log "  [dry-run] would: git fetch origin && git pull --rebase"
+		log "  [dry-run] would: git fetch origin && git pull --rebase --no-recurse-submodules"
 		LAST_COUNT=1
 		return 0
 	fi
-	if git -C "$dir" fetch origin && git -C "$dir" pull --rebase; then
+	if git -C "$dir" fetch origin \
+		&& git -C "$dir" pull --rebase --no-recurse-submodules; then
+		git -C "$dir" submodule update --init --recursive >/dev/null 2>&1 || true
 		ok "Pull complete ($(git_head_sha "$dir"))"
 		LAST_COUNT=1
 	else
@@ -2365,9 +2366,11 @@ cmd_repos_release() {
 		return 0
 	fi
 
-	info "Sync" "fetch + pull --rebase"
+	info "Sync" "fetch + pull --rebase (superproject only)"
 	git -C "$dir" fetch origin || displayError "git fetch failed"
-	git -C "$dir" pull --rebase || displayError "git pull --rebase failed"
+	git -C "$dir" pull --rebase --no-recurse-submodules \
+		|| displayError "git pull --rebase failed"
+	git -C "$dir" submodule update --init --recursive >/dev/null 2>&1 || true
 	git_is_dirty "$dir" && displayError "Dirty after pull — resolve before release"
 	sha="$(git_head_sha_full "$dir")"
 
