@@ -1237,7 +1237,7 @@ commit_submodules_if_needed() {
 	git -C "$dir" status --short | sed 's/^/    /'
 
 	if [[ "$DRY_RUN" == "1" ]]; then
-		log "  [dry-run] would commit and push"
+		log "  [dry-run] would commit (no push): chore: update dependencies"
 		return 0
 	fi
 
@@ -1247,15 +1247,11 @@ commit_submodules_if_needed() {
 		git -C "$dir" restore --staged . >/dev/null 2>&1 || true
 		return 1
 	fi
-	if ! git -C "$dir" commit -m "Updated submodules" >/dev/null; then
+	if ! git -C "$dir" commit -m "chore: update dependencies" >/dev/null; then
 		err "git commit failed in $name"
 		return 1
 	fi
-	if ! git -C "$dir" push >/dev/null; then
-		err "git push failed in $name"
-		return 1
-	fi
-	ok "Commit + push ($(git_head_sha "$dir"))"
+	ok "Commit $(git_head_sha "$dir") (not pushed)"
 	return 0
 }
 
@@ -1447,7 +1443,6 @@ cmd_submodules_update_one() {
 				_clr_new="${_CLR_YELLOW}"
 				;;
 			skip)
-				# No se aplica, pero es un fallo de resolución — no un skip voluntario.
 				_clr_new="${_CLR_BOLD_RED}"
 				;;
 			*)
@@ -1502,8 +1497,6 @@ cmd_submodules_update_one() {
 				continue
 			fi
 		else
-			# Prefer the shadow peel so a re-release (same tag, new SHA) is honoured.
-			# `git fetch --tags` will not move an existing local tag without --force.
 			planned_sha="$(git_peel_ref "$abs" "refs/sb-gh/tags/${target}" 2>/dev/null || true)"
 			if [[ -z "$planned_sha" ]]; then
 				planned_sha="$(git_peel_ref "$abs" "$target" 2>/dev/null || true)"
@@ -1517,16 +1510,25 @@ cmd_submodules_update_one() {
 				continue
 			fi
 		fi
+		if ! git -C "$dir" add -- "${plan_path[$i]}"; then
+			warn "git add ${plan_path[$i]} failed for ${plan_name[$i]}"
+			continue
+		fi
 		short="$(git -C "$abs" rev-parse --short HEAD 2>/dev/null || echo "?")"
 		ok "${plan_name[$i]} → ${short} (${plan_new[$i]})"
 	done
 
 	info "Nested" "synchronized to recorded SHAs"
-	if git -C "$dir" submodule update --init --recursive >/dev/null 2>&1; then
-		ok "Nested submodules synchronized to recorded SHAs"
-	else
-		warn "nested submodule update had errors (pins may be incomplete)"
-	fi
+	for i in "${!plan_name[@]}"; do
+		[[ "${plan_action[$i]}" == "keep" || "${plan_action[$i]}" == "skip" ]] && continue
+		abs="$dir/${plan_path[$i]}"
+		[[ -f "$abs/.gitmodules" ]] || continue
+		if git -C "$abs" submodule update --init --recursive >/dev/null 2>&1; then
+			ok "Nested pins in ${plan_name[$i]}"
+		else
+			warn "nested update had errors in ${plan_name[$i]} (pins may be incomplete)"
+		fi
+	done
 
 	if commit_submodules_if_needed "$dir"; then
 		LAST_COUNT=1
