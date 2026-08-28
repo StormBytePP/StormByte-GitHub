@@ -1301,6 +1301,7 @@ cmd_submodules_update_one() {
 	local -a plan_action=() plan_target=()
 	local -a shadow_repos=()
 	local i action target reply next next_rc cmp_sha
+	local _col_name _col_cur _col_new _clr_new
 
 	_sm_shadow_cleanup() {
 		local r
@@ -1438,7 +1439,25 @@ cmd_submodules_update_one() {
 
 	printf "  ${_CLR_DIM}%-36s  %-22s  %s${_CLR_RESET}\n" "MODULE" "CURRENT" "PLANNED"
 	for i in "${!plan_name[@]}"; do
-		printf "  %-36s  %-22s  %s\n" "${plan_name[$i]}" "${plan_cur[$i]}" "${plan_new[$i]}"
+		_col_name="$(printf '%-36s' "${plan_name[$i]}")"
+		_col_cur="$(printf '%-22s' "${plan_cur[$i]}")"
+		_col_new="${plan_new[$i]}"
+		case "${plan_action[$i]}" in
+			keep)
+				_clr_new="${_CLR_YELLOW}"
+				;;
+			skip)
+				# No se aplica, pero es un fallo de resolución — no un skip voluntario.
+				_clr_new="${_CLR_BOLD_RED}"
+				;;
+			*)
+				_clr_new="${_CLR_BOLD_GREEN}"
+				;;
+		esac
+		printf "  %s%s%s  %s%s%s  %s%s%s\n" \
+			"${_CLR_WHITE}"     "$_col_name" "${_CLR_RESET}" \
+			"${_CLR_DIM}"       "$_col_cur"  "${_CLR_RESET}" \
+			"$_clr_new"         "$_col_new"  "${_CLR_RESET}"
 	done
 
 	info "Plan" "${n_upd} update(s), ${n_re} re-release(s), ${n_unres} unresolved"
