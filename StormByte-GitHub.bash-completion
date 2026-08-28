@@ -49,6 +49,22 @@ _StormByte_GitHub() {
 	test_subs=(asan tsan)
 	dump_extra=('type=c++' 'type=cmake' 50 100 200 500)
 
+	_sb_github_collapse_slashes() {
+		local p="$1"
+		while [[ "$p" == *//* ]]; do
+			p="${p//\/\//\/}"
+		done
+		printf '%s' "$p"
+	}
+
+	_sb_github_strip_trailing_slash() {
+		local p="$1"
+		[[ -z "$p" ]] && return 0
+		p="$(_sb_github_collapse_slashes "$p")"
+		[[ "$p" == / ]] && { printf '/'; return 0; }
+		printf '%s' "${p%/}"
+	}
+
 	_sb_github_load_roots() {
 		SB_GH_ROOT="${ROOT:-}"
 		SB_GH_FORK_ROOT="${FORK_ROOT:-}"
@@ -83,12 +99,16 @@ _StormByte_GitHub() {
 
 		[[ -z "$SB_GH_ROOT" ]] && SB_GH_ROOT="$PWD"
 		[[ -z "$SB_GH_FORK_ROOT" ]] && SB_GH_FORK_ROOT="$SB_GH_ROOT"
+
+		SB_GH_ROOT="$(_sb_github_strip_trailing_slash "$SB_GH_ROOT")"
+		SB_GH_FORK_ROOT="$(_sb_github_strip_trailing_slash "$SB_GH_FORK_ROOT")"
 	}
 
 	_sb_github_repo_dirs_in() {
 		local root="$1"
 		local d
 		local -a out=()
+		root="$(_sb_github_strip_trailing_slash "$root")"
 		[[ -d "$root" ]] || return 0
 		shopt -s nullglob
 		for d in "$root"/*/; do
@@ -105,6 +125,7 @@ _StormByte_GitHub() {
 		local root="$1"
 		local d
 		local -a out=()
+		root="$(_sb_github_strip_trailing_slash "$root")"
 		[[ -d "$root" ]] || return 0
 		shopt -s nullglob
 		for d in "$root"/*/; do
@@ -117,12 +138,20 @@ _StormByte_GitHub() {
 	# Directory completion that behaves like bash "cd"
 	_sb_complete_path_dirs() {
 		local cur="$1"
+		local i p
+
+		cur="$(_sb_github_collapse_slashes "$cur")"
 
 		[[ "$cur" == "." ]] && cur="./"
 		[[ "$cur" == ".." ]] && cur="../"
 
 		compopt -o filenames 2>/dev/null
 		mapfile -t COMPREPLY < <(compgen -d -S / -- "$cur")
+
+		for i in "${!COMPREPLY[@]}"; do
+			p="$(_sb_github_collapse_slashes "${COMPREPLY[$i]}")"
+			COMPREPLY[$i]="$p"
+		done
 
 		if ((${#COMPREPLY[@]} == 1)) && [[ "${COMPREPLY[0]}" == */ ]]; then
 			if compgen -d -- "${COMPREPLY[0]}" &>/dev/null; then
@@ -187,9 +216,20 @@ _StormByte_GitHub() {
 			for r in "${repos[@]}"; do
 				candidates+=("!$r")
 			done
-			if [[ "$cur" == *'+'* ]]; then
+			if [[ "$cur" == *'+' ]]; then
+				# "!foo+" → "!foo+bar" / "!foo+!bar"  (not "!foo+!!bar")
 				for r in "${repos[@]}"; do
-					candidates+=("${cur}!$r")
+					candidates+=("${cur}${r}")
+					candidates+=("${cur}!${r}")
+				done
+			elif [[ "$cur" == *'+!' ]]; then
+				for r in "${repos[@]}"; do
+					candidates+=("${cur}${r}")
+				done
+			elif [[ "$cur" == *'+'* ]]; then
+				for r in "${repos[@]}"; do
+					candidates+=("${cur}+${r}")
+					candidates+=("${cur}+!${r}")
 				done
 			fi
 		else
@@ -206,8 +246,10 @@ _StormByte_GitHub() {
 	_sb_complete_rel_path_under_repo() {
 		local cur="$1"
 		local repo_dir="$2"
+		local i p
 
 		[[ -d "$repo_dir" ]] || return 0
+		cur="$(_sb_github_collapse_slashes "$cur")"
 
 		compopt -o filenames 2>/dev/null
 
@@ -215,6 +257,11 @@ _StormByte_GitHub() {
 			cd "$repo_dir" 2>/dev/null || exit 0
 			compgen -d -S / -- "$cur"
 		)
+
+		for i in "${!COMPREPLY[@]}"; do
+			p="$(_sb_github_collapse_slashes "${COMPREPLY[$i]}")"
+			COMPREPLY[$i]="$p"
+		done
 
 		if ((${#COMPREPLY[@]} == 1)) && [[ "${COMPREPLY[0]}" == */ ]]; then
 			if ( cd "$repo_dir" && compgen -d -- "${COMPREPLY[0]}" &>/dev/null ); then
@@ -226,9 +273,11 @@ _StormByte_GitHub() {
 	_sb_resolve_word_as_repo() {
 		local w="$1"
 		local root="$2"
+		root="$(_sb_github_strip_trailing_slash "$root")"
 		if [[ "$w" == ~* ]]; then
 			w="${w/#\~/$HOME}"
 		fi
+		w="$(_sb_github_collapse_slashes "$w")"
 		if [[ "$w" == /* || "$w" == ./* || "$w" == ../* ]]; then
 			[[ -d "$w" ]] && printf '%s\n' "$(cd "$w" && pwd)"
 			return
