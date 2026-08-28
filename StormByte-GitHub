@@ -1255,16 +1255,6 @@ commit_submodules_if_needed() {
 	return 0
 }
 
-_sm_current_label() {
-	local kind="$1" label="$2" sha="$3"
-	local short="${sha:0:7}"
-	case "$kind" in
-		branch) printf '%s (%s)' "$label" "$short" ;;
-		tag)    printf '%s (%s)' "$label" "$short" ;;
-		*)      printf 'sha:%s' "$short" ;;
-	esac
-}
-
 _sm_prompt_ref() {
 	local abs="$1" pin="$2" reason="$3"
 	local name reply
@@ -1287,6 +1277,129 @@ _sm_prompt_ref() {
 	printf '%s\n' "$reply"
 }
 
+_sm_current_label() {
+	local kind="$1" label="$2" sha="$3"
+	local short="${sha:0:7}"
+	case "$kind" in
+		branch) printf '%s (%s)' "$label" "$short" ;;
+		tag)    printf '%s (%s)' "$label" "$short" ;;
+		*)      printf 'sha:%s' "$short" ;;
+	esac
+}
+
+_sm_tag_at_commit() {
+	local abs="$1" sha="$2"
+	local name peeled
+
+	[[ -n "$sha" ]] || return 1
+
+	name="$(git -C "$abs" describe --tags --exact-match "$sha" 2>/dev/null || true)"
+	if [[ -n "$name" ]]; then
+		printf '%s\n' "$name"
+		return 0
+	fi
+
+	name="$(git -C "$abs" tag --points-at "$sha" 2>/dev/null | head -n1 || true)"
+	if [[ -n "$name" ]]; then
+		printf '%s\n' "$name"
+		return 0
+	fi
+
+	while IFS= read -r name; do
+		[[ -z "$name" ]] && continue
+		peeled="$(git_peel_ref "$abs" "refs/sb-gh/tags/${name}" 2>/dev/null \
+			|| git_peel_ref "$abs" "refs/tags/${name}" 2>/dev/null \
+			|| true)"
+		if [[ -n "$peeled" && "$peeled" == "$sha" ]]; then
+			printf '%s\n' "$name"
+			return 0
+		fi
+	done < <(git_list_tag_names "$abs" "refs/sb-gh/tags" 2>/dev/null)
+
+	return 1
+}
+
+_sm_seed_tag_from_commit() {
+	local abs="$1" sha="$2"
+	local desc seed
+
+	desc="$(git -C "$abs" describe --tags --always "$sha" 2>/dev/null || true)"
+	[[ -n "$desc" ]] || return 1
+	if [[ "$desc" == *-*-g* ]]; then
+		seed="${desc%-*-g*}"
+		printf '%s\n' "$seed"
+		return 0
+	fi
+	if git_object_exists "$abs" "refs/sb-gh/tags/${desc}" \
+		|| git_object_exists "$abs" "refs/tags/${desc}"; then
+		printf '%s\n' "$desc"
+		return 0
+	fi
+	return 1
+}
+
+_sm_latest_in_family() {
+	local abs="$1" label="$2"
+	local next cur="$label" rc=0 guard=0
+
+	while (( guard++ < 64 )); do
+		rc=0
+		next="$(git_pin_next_in_family "$abs" "$cur" "refs/sb-gh/tags")" || rc=$?
+		if (( rc != 0 )); then
+			return 1
+		fi
+		if [[ -z "$next" || "$next" == "$cur" ]]; then
+			printf '%s\n' "$cur"
+			return 0
+		fi
+		cur="$next"
+	done
+	return 1
+}
+
+# stdout: planned \t action \t target \t n_upd \t n_re \t n_unres
+_sm_plan_tag() {
+	local abs="$1" label="$2" sha="$3"
+	local next next_rc=0 cmp_sha reply latest peel_latest
+
+	if ! git_object_exists "$abs" "refs/sb-gh/tags/${label}" \
+		&& ! git_object_exists "$abs" "refs/tags/${label}" \
+		&& ! git_object_exists "$abs" "$label"; then
+		printf '%s\n' "UNRESOLVED	skip		0	0	1"
+		return 0
+	fi
+
+	next_rc=0
+	next="$(git_pin_next_in_family "$abs" "$label" "refs/sb-gh/tags")" || next_rc=$?
+	if (( next_rc != 0 )); then
+		reply="$(_sm_prompt_ref "$abs" "$label" "no unique successor in family")" || reply=""
+		if [[ -z "$reply" ]]; then
+			printf '%s\n' "UNRESOLVED	skip		0	0	1"
+		else
+			printf '%s\n' "${reply}	tag	${reply}	1	0	0"
+		fi
+		return 0
+	fi
+
+	# Tag superior en la familia: update gana siempre al re-release.
+	if [[ -n "$next" && "$next" != "$label" ]]; then
+		latest="$(_sm_latest_in_family "$abs" "$label" || printf '%s' "$next")"
+		printf '%s\n' "${latest}	tag	${latest}	1	0	0"
+		return 0
+	fi
+
+	# Misma tag, otro SHA → re-release.
+	cmp_sha="$(git_peel_ref "$abs" "refs/sb-gh/tags/${label}" 2>/dev/null \
+		|| git_peel_ref "$abs" "refs/tags/${label}" 2>/dev/null \
+		|| true)"
+	if [[ -n "$cmp_sha" && -n "$sha" && "$cmp_sha" != "$sha" ]]; then
+		printf '%s\n' "re-release (${cmp_sha:0:7})	tag	${label}	0	1	0"
+		return 0
+	fi
+
+	printf '%s\n' "No changes	keep		0	0	0"
+}
+
 cmd_submodules_update_one() {
 	local dir="$1" repo="$2"
 	local stashed=0
@@ -1296,7 +1409,8 @@ cmd_submodules_update_one() {
 	local -a plan_name=() plan_path=() plan_cur=() plan_new=()
 	local -a plan_action=() plan_target=()
 	local -a shadow_repos=()
-	local i action target reply next next_rc cmp_sha gm_branch tag_at
+	local i action target reply gm_branch tag_at seed
+	local plan_line d_upd d_re d_unres
 
 	_sm_shadow_cleanup() {
 		local r
@@ -1329,6 +1443,7 @@ cmd_submodules_update_one() {
 		action="keep"
 		target=""
 		planned="No changes"
+		d_upd=0 d_re=0 d_unres=0
 
 		if [[ "$DRY_RUN" != "1" ]]; then
 			if ! git -C "$dir" submodule update --init -- "$sm_path" >/dev/null 2>&1; then
@@ -1346,19 +1461,16 @@ cmd_submodules_update_one() {
 		if ! git_shadow_fetch "$abs"; then
 			warn "shadow fetch failed for $sm_path"
 		fi
+		git -C "$abs" fetch origin --tags --force --prune >/dev/null 2>&1 || true
 
 		IFS=$'\t' read -r kind label sha < <(git_sm_classify "$dir" "$sm_name" "$abs")
 		gm_branch="$(git -C "$dir" config -f .gitmodules --get "submodule.${sm_name}.branch" 2>/dev/null || true)"
 
-		# branch=master → follow origin/master. Anything else → pin by tag.
 		if [[ "$gm_branch" == "master" ]]; then
 			kind="branch"
 			label="master"
-		elif [[ "$kind" != "tag" || -z "$label" ]]; then
-			tag_at="$(git -C "$abs" tag --points-at "${sha:-HEAD}" 2>/dev/null | head -n1 || true)"
-			if [[ -z "$tag_at" ]]; then
-				tag_at="$(git -C "$abs" describe --tags --exact-match "${sha:-HEAD}" 2>/dev/null || true)"
-			fi
+		else
+			tag_at="$(_sm_tag_at_commit "$abs" "$sha" || true)"
 			if [[ -n "$tag_at" ]]; then
 				kind="tag"
 				label="$tag_at"
@@ -1390,51 +1502,27 @@ cmd_submodules_update_one() {
 				n_upd=$((n_upd + 1))
 			fi
 		elif [[ "$kind" == "tag" ]]; then
-			if ! git_object_exists "$abs" "refs/sb-gh/tags/${label}" \
-				&& ! git_object_exists "$abs" "refs/tags/${label}" \
-				&& ! git_object_exists "$abs" "$label"; then
-				err "Pinned tag '${label}' is missing in ${sm_name} (${sm_path})"
-				_sm_shadow_cleanup
-				if [[ "$stashed" -eq 1 ]]; then
-					git_stash_pop_safe "$dir" >/dev/null 2>&1 || true
-				fi
-				return 1
-			fi
-			next_rc=0
-			next="$(git_pin_next_in_family "$abs" "$label" "refs/sb-gh/tags")" || next_rc=$?
-			if (( next_rc != 0 )); then
-				reply="$(_sm_prompt_ref "$abs" "$label" "no unique successor in family")" || reply=""
-				if [[ -z "$reply" ]]; then
-					planned="UNRESOLVED"
-					action="skip"
-					n_unres=$((n_unres + 1))
-				else
-					planned="$reply"
-					action="tag"
-					target="$reply"
-					n_upd=$((n_upd + 1))
-				fi
-			elif [[ -z "$next" || "$next" == "$label" ]]; then
-				cmp_sha="$(git_peel_ref "$abs" "refs/sb-gh/tags/${label}" 2>/dev/null || true)"
-				if [[ -n "$cmp_sha" && -n "$sha" && "$cmp_sha" != "$sha" ]]; then
-					planned="re-release (${cmp_sha:0:7})"
-					action="tag"
-					target="$label"
-					n_re=$((n_re + 1))
-				else
-					planned="No changes"
-					action="keep"
-				fi
-			else
-				planned="$next"
-				action="tag"
-				target="$next"
-				n_upd=$((n_upd + 1))
-			fi
+			plan_line="$(_sm_plan_tag "$abs" "$label" "$sha")"
+			IFS=$'\t' read -r planned action target d_upd d_re d_unres <<<"$plan_line"
+			n_upd=$((n_upd + d_upd))
+			n_re=$((n_re + d_re))
+			n_unres=$((n_unres + d_unres))
 		else
-			planned="UNRESOLVED"
-			action="skip"
-			n_unres=$((n_unres + 1))
+			seed="$(_sm_seed_tag_from_commit "$abs" "$sha" || true)"
+			if [[ -z "$seed" ]]; then
+				seed="$(git_list_tag_names "$abs" "refs/sb-gh/tags" 2>/dev/null | sort -V | tail -n1 || true)"
+			fi
+			if [[ -n "$seed" ]]; then
+				current_lbl="$(_sm_current_label tag "$seed" "$sha")"
+				plan_line="$(_sm_plan_tag "$abs" "$seed" "$sha")"
+				IFS=$'\t' read -r planned action target d_upd d_re d_unres <<<"$plan_line"
+				n_upd=$((n_upd + d_upd))
+				n_re=$((n_re + d_re))
+				n_unres=$((n_unres + d_unres))
+			else
+				planned="No changes"
+				action="keep"
+			fi
 		fi
 
 		plan_name+=("$sm_name")
@@ -1492,7 +1580,7 @@ cmd_submodules_update_one() {
 				continue
 			fi
 		else
-			git -C "$abs" fetch origin --tags --prune >/dev/null 2>&1 || true
+			git -C "$abs" fetch origin --tags --force --prune >/dev/null 2>&1 || true
 			if ! git -C "$abs" checkout --detach "$target" >/dev/null 2>&1; then
 				warn "checkout ${target} failed for ${plan_name[$i]}"
 				continue
