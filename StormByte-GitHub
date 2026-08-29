@@ -281,7 +281,7 @@ ${_CLR_BOLD_CYAN}ci stop|start|restart|status${_CLR_RESET}  [dir-spec] [--failed
 	Manage workflow runs.
 	--failed   Only re-run failed/cancelled/timed_out runs
 
-${_CLR_BOLD_CYAN}submodules init|deinit|update|list|details${_CLR_RESET}  [dir-spec] [--confirm] [--latest] [--all]
+${_CLR_BOLD_CYAN}submodules init|deinit|update|list|details${_CLR_RESET}  [dir-spec] [--confirm] [--latest] [--all] [--module …] [--tag …]
 	Submodule operations (update walks ROOT in dependency order).
 	init     git submodule update --init --recursive
 	deinit   git submodule deinit --all -f
@@ -290,31 +290,32 @@ ${_CLR_BOLD_CYAN}submodules init|deinit|update|list|details${_CLR_RESET}  [dir-s
 			LATEST is the newest recognised release in the module
 			(same criterion as update --latest). A (semver) suffix is
 			added only when the ref text is not already that semver.
-			Read-only: shadow-fetch tags, no checkout, no commit.
-			--all  after each row, list tags that are ancestors of
-			origin/master or origin/main (wrapped) and origin branches.
-			The current pin is marked with * in those lists.
+			Read-only. --all lists tags on master/main and origin branches.
+			--module <name|path>     only that first-level module
+			--module '!a+!b'         all first-level modules except those
 	update   First-level modules only; nested ones stay on the SHAs
 			recorded by their parent after the roots are staged.
+			--module / --module '!…' as in details.
+			Rows not selected still appear in the plan as No changes.
+			--tag <tag>  requires a positive --module. That row pins the
+			exact tag (character match) and ignores family / --latest.
+			DRY_RUN=1 prints the plan and does not checkout.
 
 			Policy (branch= in .gitmodules of the parent):
 			A  branch=master
 				Float to origin/master. Already at that SHA → No changes.
 			B1 no master, checkout is a recognised release tag
-				Move to the latest tag in the same family (same prefix and
-				grain: postgres REL_<major>, Crypto++ CRYPTOPP_<X.Y>,
-				own libs X.Y). Same tag, different SHA → re-release.
-			B2 no master, checkout is not a tag (e.g. master was removed)
-				Pin to the latest tag of the inferred family (intentional
-				downgrade is allowed). Else the newest recognised release.
-			Unrecognised pins → UNRESOLVED. On a TTY you can type a ref;
-			--confirm / non-TTY skips those rows.
+				Move to the latest tag in the same family.
+			B2 no master, checkout is not a tag
+				Pin to the latest tag of the inferred family (downgrade OK).
+				Else the newest recognised release.
 			--latest  B1 and B2 use the newest recognised release in the
-			module, including a new major. Default stays in-family.
+			module, including a new major. Ignored on a --tag row.
+			Unrecognised pins → UNRESOLVED. --confirm / non-TTY skips them.
 
 			Prints MODULE / CURRENT / PLANNED, then asks [y/N] unless
-			--confirm or DRY_RUN=1. Parent dirty tree is stashed and restored.
-			Commits "chore: update dependencies" locally (no push).
+			--confirm or DRY_RUN=1. Commits "chore: update dependencies"
+			locally (no push).
 
 ${_CLR_BOLD_CYAN}submodules add${_CLR_RESET}  <dir> <URL> <path> --name <name>
 	Add a submodule (no init/update after). --name anywhere; path relative, no '..'.
@@ -414,30 +415,14 @@ ${_CLR_BOLD}EXAMPLES${_CLR_RESET}
 ${SCRIPT_NAME} cache delete '!multimedia'
 ${SCRIPT_NAME} ci start --failed
 ${SCRIPT_NAME} repos list
-${SCRIPT_NAME} repos dump ./base type=cmake 200
-${SCRIPT_NAME} repos status
-${SCRIPT_NAME} repos push '!multimedia'
-${SCRIPT_NAME} repos release --list
-${SCRIPT_NAME} repos release database --list
-${SCRIPT_NAME} repos release --list 1.0.0
-${SCRIPT_NAME} repos release database 1.0.0 --list
-${SCRIPT_NAME} repos release database 1.0.0
-${SCRIPT_NAME} repos release database 1.0.0 --skip-ci
-${SCRIPT_NAME} repos release database 1.0.0 --delete
-DRY_RUN=1 ${SCRIPT_NAME} repos release database 1.0.0
-ROOT=~/Software ${SCRIPT_NAME} git sync
-${SCRIPT_NAME} submodules details network
-${SCRIPT_NAME} submodules details network --all
+${SCRIPT_NAME} submodules details --module 'StormByte BuildMaster'
+${SCRIPT_NAME} submodules details network --module 'StormByte BuildMaster' --all
+${SCRIPT_NAME} submodules update --module 'StormByte BuildMaster' --tag 2.0.0
 ${SCRIPT_NAME} submodules update network --latest
+ROOT=~/Software ${SCRIPT_NAME} git sync
 FORK_ROOT=~/Forks ${SCRIPT_NAME} fork status
-FORK_ROOT=~/Forks ${SCRIPT_NAME} fork sync
 ${SCRIPT_NAME} search \"mimalloc\"
-${SCRIPT_NAME} clone-all
-${SCRIPT_NAME} test asan
 ${SCRIPT_NAME} test asan multimedia
-${SCRIPT_NAME} test tsan '!multimedia'
-${SCRIPT_NAME} test asan database --cmake-options \"-DENABLE_FOO=ON\" --verbose
-${SCRIPT_NAME} test asan multimedia --executable bin/my_test --outfile /tmp/report.txt
 
 ${_CLR_BOLD}NOTES${_CLR_RESET}
 • Repositories must belong to the configured OWNER (or OWNER env override).
@@ -1074,21 +1059,64 @@ commit_submodules_if_needed() {
 cmd_submodules_update_one() {
 	local dir="$1" repo="$2"
 	local stashed=0
-	local sm_name sm_path sm_url abs action kind current planned target sha
-	local latest newest reply sha_new got short prefix
-	local n_upd=0 n_re=0 n_unres=0
+	local sm_name sm_path sm_url abs short
+	local action kind current planned target sha
+	local n_upd=0 n_re=0 n_unres=0 n_mod=0 i_mod=0
 	local -a plan_name=() plan_path=() plan_cur=() plan_new=()
 	local -a plan_action=() plan_kind=() plan_target=()
 	local -a shadow_repos=()
-	local plan_line
+	local i reply sha_new got latest latest_sha prefix tag_sha br_sha pin_label
+	local plan_line pin_id latest_id
+	local heads="${GIT_SHADOW_HEADS:-refs/sb-gh/heads}"
 
 	prefix="${GIT_SHADOW_TAGS:-refs/sb-gh/tags}"
+
+	_sm_trim() {
+		local s="${1:-}"
+		s="${s//$'\r'/}"
+		s="${s//$'\n'/}"
+		s="${s#"${s%%[![:space:]]*}"}"
+		s="${s%"${s##*[![:space:]]}"}"
+		printf '%s' "$s"
+	}
+
+	_sm_parse_id() {
+		git_pin_parse "${1:-}" 2>/dev/null | cut -f1-5
+		return 0
+	}
+
+	_sm_hint() {
+		printf '\r\033[K  Analyzing %s (%s/%s)…' "$1" "$2" "$3" >&2
+	}
+
+	_sm_hint_clear() {
+		printf '\r\033[K' >&2
+	}
 
 	_sm_shadow_cleanup() {
 		local r
 		for r in "${shadow_repos[@]}"; do
 			git_shadow_delete "$r"
 		done
+	}
+
+	_sm_cheap_current() {
+		local repo="$1" out kind label sha
+		[[ -d "$repo" ]] || { printf '%s' ""; return 0; }
+		IFS=$'\t' read -r kind label sha < <(git_sm_classify "$dir" "$sm_name" "$repo" 2>/dev/null || true)
+		sha="$(_sm_trim "$sha")"
+		label="$(_sm_trim "$label")"
+		if [[ "$kind" == "tag" || "$kind" == "branch" ]] && [[ -n "$label" ]]; then
+			if [[ -n "$sha" ]]; then
+				printf '%s (%s)' "$label" "${sha:0:7}"
+			else
+				printf '%s' "$label"
+			fi
+		elif [[ -n "$sha" ]]; then
+			printf 'sha:%s' "${sha:0:7}"
+		else
+			printf '%s' ""
+		fi
 	}
 
 	info "Path" "$dir"
@@ -1109,6 +1137,15 @@ cmd_submodules_update_one() {
 
 	git -C "$dir" fetch origin --prune >/dev/null 2>&1 || true
 
+	n_mod=0
+	while IFS=$'\t' read -r sm_name sm_path sm_url; do
+		[[ -z "$sm_name" || -z "$sm_path" ]] && continue
+		_sm_module_wanted "$sm_name" "$sm_path" || continue
+		n_mod=$((n_mod + 1))
+	done < <(git_gitmodules_list "$dir")
+	(( n_mod == 0 )) && n_mod=1
+
+	i_mod=0
 	while IFS=$'\t' read -r sm_name sm_path sm_url; do
 		[[ -z "$sm_name" || -z "$sm_path" ]] && continue
 		abs="$dir/$sm_path"
@@ -1118,28 +1155,59 @@ cmd_submodules_update_one() {
 		planned="No changes"
 		target=""
 		sha=""
+		pin_label=""
+		latest=""
+		latest_sha=""
+		pin_id=""
+		latest_id=""
+		plan_line=""
+
+		if ! _sm_module_wanted "$sm_name" "$sm_path"; then
+			current="$(_sm_cheap_current "$abs")"
+			plan_name+=("$sm_name")
+			plan_path+=("$sm_path")
+			plan_cur+=("$current")
+			plan_new+=("No changes")
+			plan_action+=("keep")
+			plan_kind+=("sha")
+			plan_target+=("")
+			continue
+		fi
+
+		i_mod=$((i_mod + 1))
+		_sm_hint "$sm_name" "$i_mod" "$n_mod"
 
 		if [[ "$DRY_RUN" != "1" ]]; then
 			if ! git -C "$dir" submodule update --init -- "$sm_path" >/dev/null 2>&1; then
+				_sm_hint_clear
 				warn "init failed for $sm_path"
 				continue
 			fi
 		fi
 
 		if [[ ! -d "$abs" ]]; then
+			_sm_hint_clear
 			warn "missing work tree for $sm_path"
 			continue
 		fi
 
 		shadow_repos+=("$abs")
 		if ! git_shadow_fetch "$abs"; then
+			_sm_hint_clear
 			warn "shadow fetch failed for $sm_path"
 		fi
 
 		plan_line="$(git_sm_plan "$dir" "$sm_name" "$abs")" || plan_line=""
-		IFS=$'\t' read -r action kind current planned target sha <<<"$plan_line"
+		IFS=$'\x1f' read -r action kind current planned target sha _ <<<"${plan_line//$'\t'/$'\x1f'}"
+		action="$(_sm_trim "$action")"
+		kind="$(_sm_trim "$kind")"
+		current="$(_sm_trim "$current")"
+		planned="$(_sm_trim "$planned")"
+		target="$(_sm_trim "$target")"
+		sha="$(_sm_trim "$sha")"
 
 		if [[ "$action" == "error" ]]; then
+			_sm_hint_clear
 			err "${planned:-plan failed} for ${sm_name}"
 			_sm_shadow_cleanup
 			if [[ "$stashed" -eq 1 ]]; then
@@ -1148,48 +1216,125 @@ cmd_submodules_update_one() {
 			return 1
 		fi
 
-		if [[ "${SM_LATEST:-0}" == "1" ]]; then
-			newest="$(git_pin_latest_recognised "$abs" "$prefix" 2>/dev/null || true)"
-			if [[ -n "$newest" ]]; then
-				if [[ "$planned" != "$newest" ]]; then
-					action="update"
-					kind="tag"
-					planned="$newest"
-					target="$newest"
-				fi
-			fi
-		elif [[ "$action" == "update" && "$kind" == "tag" && -n "$target" ]]; then
-			latest="$(git_pin_latest_in_family "$abs" "$target" "$prefix" 2>/dev/null || true)"
-			if [[ -n "$latest" ]]; then
-				planned="$latest"
-				target="$latest"
-			fi
+		pin_label="$(_sm_trim "$(git_exact_tag_at_sha "$abs" "$sha" 2>/dev/null || true)")"
+		pin_label="$(_sm_trim "$(git_ref_basename "$pin_label")")"
+		if [[ -z "$pin_label" && "$current" != sha:* && -n "$current" ]]; then
+			pin_label="$(_sm_trim "${current%% (*)}")"
 		fi
 
-		if [[ "$action" == "skip" ]]; then
-			reply="$(_sm_prompt_ref "$abs" "${current:-$sm_name}" "${planned:-unresolved}")" || reply=""
-			if [[ -n "$reply" ]]; then
-				if git_peel_ref "$abs" "${GIT_SHADOW_HEADS:-refs/sb-gh/heads}/${reply}" >/dev/null 2>&1 \
-					|| git_peel_ref "$abs" "refs/remotes/origin/${reply}" >/dev/null 2>&1; then
-					action="update"
-					kind="branch"
-					planned="$reply"
-					target="$reply"
-					n_upd=$((n_upd + 1))
-				else
-					action="update"
-					kind="tag"
-					planned="$reply"
-					target="$reply"
-					n_upd=$((n_upd + 1))
-				fi
+		if [[ -n "${SM_TAG:-}" ]]; then
+			tag_sha="$(git_peel_ref "$abs" "${prefix}/${SM_TAG}" 2>/dev/null \
+				|| git_peel_ref "$abs" "refs/tags/${SM_TAG}" 2>/dev/null \
+				|| true)"
+			tag_sha="$(_sm_trim "$tag_sha")"
+			if [[ -z "$tag_sha" ]]; then
+				action="skip"
+				kind="tag"
+				planned="UNRESOLVED (no tag ${SM_TAG})"
+				target=""
+				n_unres=$((n_unres + 1))
+			elif [[ -n "$sha" && "$tag_sha" == "$sha" ]]; then
+				action="keep"
+				planned="No changes"
+				target=""
 			else
+				action="update"
+				kind="tag"
+				planned="$SM_TAG"
+				target="$SM_TAG"
+				n_upd=$((n_upd + 1))
+			fi
+		elif [[ -n "${SM_BRANCH:-}" ]]; then
+			br_sha="$(git_peel_ref "$abs" "${heads}/${SM_BRANCH}" 2>/dev/null \
+				|| git_peel_ref "$abs" "refs/remotes/origin/${SM_BRANCH}" 2>/dev/null \
+				|| true)"
+			br_sha="$(_sm_trim "$br_sha")"
+			if [[ -z "$br_sha" ]]; then
+				action="skip"
+				kind="branch"
+				planned="UNRESOLVED (no branch ${SM_BRANCH})"
+				target=""
+				n_unres=$((n_unres + 1))
+			elif [[ -n "$sha" && "$br_sha" == "$sha" ]]; then
+				action="keep"
+				planned="No changes"
+				target=""
+			else
+				action="update"
+				kind="branch"
+				planned="$SM_BRANCH"
+				target="$SM_BRANCH"
+				n_upd=$((n_upd + 1))
+			fi
+		elif [[ "${SM_LATEST:-0}" == "1" && "$kind" == "branch" ]]; then
+			if [[ "$action" == "update" ]]; then
+				n_upd=$((n_upd + 1))
+			elif [[ "$action" == "rerelease" ]]; then
+				n_re=$((n_re + 1))
+			elif [[ "$action" == "skip" ]]; then
 				n_unres=$((n_unres + 1))
 			fi
-		elif [[ "$action" == "update" ]]; then
-			n_upd=$((n_upd + 1))
-		elif [[ "$action" == "rerelease" ]]; then
-			n_re=$((n_re + 1))
+		elif [[ "${SM_LATEST:-0}" == "1" ]]; then
+			latest="$(_sm_trim "$(git_pin_latest_recognised "$abs" "$prefix" "$pin_label" 2>/dev/null || true)")"
+			latest="$(_sm_trim "$(git_ref_basename "$latest")")"
+			latest_sha=""
+			if [[ -n "$latest" ]]; then
+				latest_sha="$(_sm_trim "$(git_peel_ref "$abs" "refs/tags/${latest}" 2>/dev/null \
+					|| git_peel_ref "$abs" "${prefix}/${latest}" 2>/dev/null \
+					|| git_peel_ref "$abs" "$latest" 2>/dev/null || true)")"
+			fi
+			pin_id="$(_sm_parse_id "$pin_label" || true)"
+			latest_id="$(_sm_parse_id "$latest" || true)"
+			if [[ -z "$latest" ]]; then
+				action="keep"
+				planned="No changes"
+				target=""
+			elif [[ -n "$pin_label" && "$latest" == "$pin_label" ]]; then
+				action="keep"
+				planned="No changes"
+				target=""
+			else
+				action="update"
+				kind="tag"
+				planned="$latest"
+				target="$latest"
+				n_upd=$((n_upd + 1))
+			fi
+		else
+			if [[ "$action" == "update" && "$kind" == "tag" && -n "$target" ]]; then
+				latest="$(_sm_trim "$(git_pin_latest_in_family "$abs" "$target" "$prefix" 2>/dev/null || true)")"
+				if [[ -n "$latest" ]]; then
+					planned="$latest"
+					target="$latest"
+				fi
+			fi
+
+			if [[ "$action" == "skip" ]]; then
+				_sm_hint_clear
+				reply="$(_sm_prompt_ref "$abs" "${current:-$sm_name}" "${planned:-unresolved}")" || reply=""
+				if [[ -n "$reply" ]]; then
+					if git_peel_ref "$abs" "${heads}/${reply}" >/dev/null 2>&1 \
+						|| git_peel_ref "$abs" "refs/remotes/origin/${reply}" >/dev/null 2>&1; then
+						action="update"
+						kind="branch"
+						planned="$reply"
+						target="$reply"
+						n_upd=$((n_upd + 1))
+					else
+						action="update"
+						kind="tag"
+						planned="$reply"
+						target="$reply"
+						n_upd=$((n_upd + 1))
+					fi
+				else
+					n_unres=$((n_unres + 1))
+				fi
+			elif [[ "$action" == "update" ]]; then
+				n_upd=$((n_upd + 1))
+			elif [[ "$action" == "rerelease" ]]; then
+				n_re=$((n_re + 1))
+			fi
 		fi
 
 		plan_name+=("$sm_name")
@@ -1200,6 +1345,7 @@ cmd_submodules_update_one() {
 		plan_kind+=("$kind")
 		plan_target+=("$target")
 	done < <(git_gitmodules_list "$dir")
+	_sm_hint_clear
 
 	print_columns --header MODULE CURRENT PLANNED
 	for i in "${!plan_name[@]}"; do
@@ -1207,12 +1353,12 @@ cmd_submodules_update_one() {
 	done
 
 	info "Plan" "${n_upd} update(s), ${n_re} re-release(s), ${n_unres} unresolved"
-	if [[ "${SM_CONFIRM:-0}" == "1" ]]; then
-		info "Mode" "--confirm"
-	fi
-	if [[ "${SM_LATEST:-0}" == "1" ]]; then
-		info "Mode" "--latest"
-	fi
+	[[ "${SM_CONFIRM:-0}" == "1" ]] && info "Mode" "--confirm"
+	[[ "${SM_LATEST:-0}" == "1" ]] && info "Mode" "--latest"
+	[[ -n "${SM_MODULE:-}" ]] && info "Module" "$SM_MODULE"
+	((${#SM_MODULE_EXCL[@]} > 0)) && info "Module exclude" "${SM_MODULE_EXCL[*]}"
+	[[ -n "${SM_TAG:-}" ]] && info "Tag" "$SM_TAG"
+	[[ -n "${SM_BRANCH:-}" ]] && info "Branch" "$SM_BRANCH"
 
 	if [[ "$DRY_RUN" == "1" ]]; then
 		log "  [dry-run] no checkout"
@@ -1431,11 +1577,63 @@ _sm_details_wrap() {
 	printf '%s\n' "$line"
 }
 
+_sm_prompt_ref() {
+	local repo="$1" current="$2" hint="${3:-}"
+	local reply=""
+	if [[ "${SM_CONFIRM:-0}" == "1" ]] || ! is_tty; then
+		return 1
+	fi
+	if [[ -n "$hint" ]]; then
+		warn "Unresolved pin '${current}' (${hint}). Type a ref, or Enter to skip."
+	else
+		warn "Unresolved pin '${current}'. Type a ref, or Enter to skip."
+	fi
+	if read_input "Ref" reply && [[ -n "$reply" ]]; then
+		printf '%s\n' "$reply"
+		return 0
+	fi
+	return 1
+}
+
+_sm_module_wanted() {
+	local name="$1" path="$2" e
+	if [[ -n "${SM_MODULE:-}" ]]; then
+		[[ "$name" == "$SM_MODULE" || "$path" == "$SM_MODULE" ]]
+		return
+	fi
+	if ((${#SM_MODULE_EXCL[@]} == 0)); then
+		return 0
+	fi
+	for e in "${SM_MODULE_EXCL[@]}"; do
+		[[ -z "$e" ]] && continue
+		if [[ "$name" == "$e" || "$path" == "$e" ]]; then
+			return 1
+		fi
+	done
+	return 0
+}
+
+_sm_parse_module_flag() {
+	local spec="$1" part
+	SM_MODULE=""
+	SM_MODULE_EXCL=()
+	[[ -n "$spec" ]] || return 0
+	if [[ "$spec" == !* ]]; then
+		IFS='+' read -ra part <<< "$spec"
+		for spec in "${part[@]}"; do
+			spec="${spec#!}"
+			[[ -n "$spec" ]] && SM_MODULE_EXCL+=("$spec")
+		done
+		return 0
+	fi
+	SM_MODULE="$spec"
+}
+
 cmd_submodules_details_one() {
 	local dir="$1" repo="$2"
 	local sm_name sm_path sm_url abs
 	local name url pin_shown latest_shown pin_raw latest_raw
-	local tag br shown count=0
+	local tag br shown count=0 matched=0 seed
 	local -a shadow_repos=() tags=() branches=() wrap_items=()
 	local prefix="${GIT_SHADOW_TAGS:-refs/sb-gh/tags}"
 
@@ -1460,6 +1658,10 @@ cmd_submodules_details_one() {
 
 	while IFS=$'\t' read -r sm_name sm_path sm_url; do
 		[[ -z "$sm_name" || -z "$sm_path" ]] && continue
+		if ! _sm_module_wanted "$sm_name" "$sm_path"; then
+			continue
+		fi
+		matched=$((matched + 1))
 		abs="$dir/$sm_path"
 		if [[ ! -d "$abs" ]]; then
 			warn "missing work tree for $sm_path"
@@ -1490,13 +1692,16 @@ cmd_submodules_details_one() {
 			continue
 		fi
 
-		mapfile -t tags < <(git_sm_details_trunk_tags "$abs" "$prefix")
+		seed="$pin_raw"
+		if ! git_pin_parse "$seed" >/dev/null 2>&1; then
+			seed="$latest_raw"
+		fi
+		mapfile -t tags < <(git_sm_details_trunk_tags "$abs" "$prefix" "$seed")
 		wrap_items=()
+		printf "      ${_CLR_DIM}tags on master${_CLR_RESET}\n"
 		if ((${#tags[@]} == 0)); then
-			printf "      ${_CLR_DIM}tags on master${_CLR_RESET}\n"
 			_sm_details_wrap "          "
 		else
-			printf "      ${_CLR_DIM}tags on master${_CLR_RESET}\n"
 			for tag in "${tags[@]}"; do
 				shown="$(git_pin_display_label "$tag")"
 				if [[ "$tag" == "$pin_raw" ]]; then
@@ -1527,6 +1732,10 @@ cmd_submodules_details_one() {
 	done < <(git_gitmodules_list "$dir")
 
 	_sm_details_cleanup
+
+	if [[ -n "${SM_MODULE:-}" && "$matched" -eq 0 ]]; then
+		warn "No first-level module named or pathed '${SM_MODULE}'"
+	fi
 	info "Count" "$count"
 	ok "Details for $count submodule(s)"
 	LAST_COUNT=$count
@@ -1538,28 +1747,85 @@ cmd_submodules() {
 	local target=""
 	local name dir repo arg
 	local -a ordered=() rest=()
+	local module_spec=""
+	local usage_sm="submodules init|deinit|update|list|details [dir-spec] [--confirm] [--latest] [--all] [--module <name|path|!spec>] [--tag <tag>] [--branch <branch>] | add … | delete …"
 
 	if [[ -z "$sub" ]]; then
-		usage_error "Missing submodules subcommand" \
-			"submodules init|deinit|update|list|details [dir-spec] [--confirm] [--latest] [--all] | add … | delete …"
+		usage_error "Missing submodules subcommand" "$usage_sm"
 	fi
+
+	case "$sub" in
+		add)
+			cmd_submodules_add "$@"
+			return
+			;;
+		delete)
+			cmd_submodules_delete "$@"
+			return
+			;;
+	esac
 
 	SM_CONFIRM=0
 	SM_LATEST=0
 	SM_ALL=0
-	for arg in "$@"; do
+	SM_TAG=""
+	SM_BRANCH=""
+	SM_MODULE=""
+	SM_MODULE_EXCL=()
+
+	while [[ $# -gt 0 ]]; do
+		arg="$1"
+		shift
 		case "$arg" in
 			--confirm) SM_CONFIRM=1 ;;
 			--latest)  SM_LATEST=1 ;;
 			--all)     SM_ALL=1 ;;
-			-*)
-				usage_error "Unknown option: $arg" \
-					"submodules ${sub} [dir-spec] [--confirm] [--latest] [--all]"
+			--module)
+				[[ $# -gt 0 ]] || usage_error "--module requires a value" "$usage_sm"
+				module_spec="$1"
+				shift
 				;;
-			*) rest+=("$arg") ;;
+			--module=*)
+				module_spec="${arg#--module=}"
+				;;
+			--tag)
+				[[ $# -gt 0 ]] || usage_error "--tag requires a value" "$usage_sm"
+				SM_TAG="$1"
+				shift
+				;;
+			--tag=*)
+				SM_TAG="${arg#--tag=}"
+				;;
+			--branch)
+				[[ $# -gt 0 ]] || usage_error "--branch requires a value" "$usage_sm"
+				SM_BRANCH="$1"
+				shift
+				;;
+			--branch=*)
+				SM_BRANCH="${arg#--branch=}"
+				;;
+			-*)
+				usage_error "Unknown option: $arg" "$usage_sm"
+				;;
+			*)
+				rest+=("$arg")
+				;;
 		esac
 	done
 	target="${rest[0]:-}"
+	_sm_parse_module_flag "$module_spec"
+
+	if [[ -n "$SM_TAG" && -n "$SM_BRANCH" ]]; then
+		usage_error "--tag and --branch are mutually exclusive" "$usage_sm"
+	fi
+	if [[ -n "$SM_TAG" ]]; then
+		[[ "$sub" == "update" ]] || usage_error "--tag is only valid for submodules update" "$usage_sm"
+		[[ -n "$SM_MODULE" ]] || usage_error "--tag requires --module <name|path> (not an exclusion)" "$usage_sm"
+	fi
+	if [[ -n "$SM_BRANCH" ]]; then
+		[[ "$sub" == "update" ]] || usage_error "--branch is only valid for submodules update" "$usage_sm"
+		[[ -n "$SM_MODULE" ]] || usage_error "--branch requires --module <name|path> (not an exclusion)" "$usage_sm"
+	fi
 
 	case "$sub" in
 		init)
@@ -1609,15 +1875,8 @@ cmd_submodules() {
 			foreach_repo cmd_submodules_details_one "$target"
 			print_summary "submodules detailed" "$__walk_total"
 			;;
-		add)
-			cmd_submodules_add "$@"
-			;;
-		delete)
-			cmd_submodules_delete "$@"
-			;;
 		*)
-			usage_error "Unknown submodules subcommand: $sub" \
-				"submodules init|deinit|update|list|details [dir-spec] [--confirm] [--latest] [--all] | add … | delete …"
+			usage_error "Unknown submodules subcommand: $sub" "$usage_sm"
 			;;
 	esac
 }

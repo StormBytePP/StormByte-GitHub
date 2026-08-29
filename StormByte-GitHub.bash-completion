@@ -416,23 +416,31 @@ _StormByte_GitHub() {
 			;;
 		update)
 			if [[ "$cur" == -* ]]; then
-				mapfile -t COMPREPLY < <(compgen -W "--confirm --latest" -- "$cur")
+				mapfile -t COMPREPLY < <(compgen -W "--confirm --latest --module --tag --branch" -- "$cur")
 				return 0
 			fi
+			case "$prev" in
+			--module|--tag|--branch)
+				return 0
+				;;
+			esac
 			_sb_complete_repo_spec "$cur" "$SB_GH_ROOT"
 			local -a extra=()
-			mapfile -t extra < <(compgen -W "--confirm --latest" -- "$cur")
+			mapfile -t extra < <(compgen -W "--confirm --latest --module --tag --branch" -- "$cur")
 			COMPREPLY+=("${extra[@]}")
 			return 0
 			;;
 		details)
 			if [[ "$cur" == -* ]]; then
-				mapfile -t COMPREPLY < <(compgen -W "--all" -- "$cur")
+				mapfile -t COMPREPLY < <(compgen -W "--all --module" -- "$cur")
+				return 0
+			fi
+			if [[ "$prev" == --module ]]; then
 				return 0
 			fi
 			_sb_complete_repo_spec "$cur" "$SB_GH_ROOT"
 			local -a extra=()
-			mapfile -t extra < <(compgen -W "--all" -- "$cur")
+			mapfile -t extra < <(compgen -W "--all --module" -- "$cur")
 			COMPREPLY+=("${extra[@]}")
 			return 0
 			;;

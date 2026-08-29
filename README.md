@@ -24,12 +24,12 @@ source dumps, releases, forks, search/clone helpers, and sanitizer test drivers.
 | **Cache** | `show` / `list` / `delete` GitHub Actions caches; optional `--name` glob |
 | **CI** | `stop` / `start` / `restart` / `status` of workflow runs; `--failed` |
 | **Git** | `reset` (hard + clean + submodules), `pull` / `sync` (rebase **without** re-pinning first-level modules) |
-| **Submodules** | `init` / `deinit` / `update` / `list` / `details` / `add` / `delete`. First-level update follows A / B1 / B2; `--latest` may cross major; `details` reports PIN vs newest release |
+| **Submodules** | `init` / `deinit` / `update` / `list` / `details` / `add` / `delete`. Update follows A / B1 / B2; `--latest` may cross major; `--module` / `--tag` filter or pin one gitlink; `details` reports PIN vs newest release |
 | **Repos** | inventory, source dump, status, push, release (create / list / delete) |
 | **Fork** | `status` / `sync` / `branch-status` under optional `FORK_ROOT` |
 | **Search / clone** | code search and `clone-all` for the configured owner |
 | **Test** | `asan` / `tsan` via CMake + ctest or a binary |
-| **Dir-spec** | all repos under the root, a single path, or exclusions (`!name`, `!a+!b`) |
+| **Dir-spec** | parent clones under the root, a single path, or exclusions (`!name`, `!a+!b`). Never a submodule name (`--module` does that) |
 
 Per-run environment overrides (`DRY_RUN`, `ROOT`, `OUT`, `OWNER`, `FORK_ROOT`, …)
 apply without editing the config file.
@@ -112,7 +112,8 @@ Other variables:
 
 ## Directory selection (dir-spec)
 
-Used by most multi-repo commands:
+Used by most multi-repo commands. Always a **local clone path**, never a
+GitHub repo name and never a submodule name.
 
 | Spec | Meaning |
 |------|---------|
@@ -121,9 +122,8 @@ Used by most multi-repo commands:
 | `!<name>` | All under the root **except** that basename |
 | `!a+!b` | Exclude several basenames |
 
-The argument is always a **local directory** (clone path), never the GitHub
-repo name. The effective root is `ROOT`, except `fork`, which uses `FORK_ROOT`
-(or `ROOT` if unset).
+The effective root is `ROOT`, except `fork`, which uses `FORK_ROOT` (or `ROOT`
+if unset).
 
 Quote exclusions in interactive shells so history expansion does not consume `!`:
 
@@ -142,6 +142,8 @@ StormByte-GitHub <command> [subcommand] [arguments…]
 
 No arguments, or `help`, prints full usage.
 
+---
+
 ### Cache
 
 ```bash
@@ -156,6 +158,8 @@ StormByte-GitHub cache delete '!multimedia'
 API until empty (or `MAX_PAGES`). With `--name`, it stops when a page has no
 matches.
 
+---
+
 ### CI
 
 ```bash
@@ -168,6 +172,8 @@ StormByte-GitHub ci restart multimedia
 `stop` cancels active runs (`in_progress` / `queued` / `pending` / `waiting` /
 `requested`) on the current branch. `start` re-runs finished workflows
 (deduplicated by workflow name). `restart` = stop + pause + start.
+
+---
 
 ### Git
 
@@ -184,18 +190,24 @@ ROOT=~/Software StormByte-GitHub git sync '!multimedia'
 | `pull` | `fetch origin` + `pull --rebase --no-recurse-submodules`, then nested modules sync to SHAs **already recorded** by the parent |
 | `sync` | Alias for `pull`. Does **not** re-pin first-level modules (that is `submodules update`) |
 
+---
+
 ### Submodules
 
 ```bash
 StormByte-GitHub submodules list
 StormByte-GitHub submodules details
 StormByte-GitHub submodules details network
-StormByte-GitHub submodules details network --all
+StormByte-GitHub submodules details --module 'StormByte BuildMaster'
+StormByte-GitHub submodules details network --module 'StormByte BuildMaster' --all
 StormByte-GitHub submodules init
 StormByte-GitHub submodules deinit
 StormByte-GitHub submodules update
 StormByte-GitHub submodules update multimedia --confirm
 StormByte-GitHub submodules update network --latest
+StormByte-GitHub submodules update --module 'StormByte BuildMaster'
+StormByte-GitHub submodules update --module 'StormByte BuildMaster' --tag 2.0.0
+DRY_RUN=1 StormByte-GitHub submodules update --module 'StormByte BuildMaster'
 StormByte-GitHub submodules add <dir> <URL> <path> --name <name>
 StormByte-GitHub submodules delete <dir> --name <name>
 StormByte-GitHub submodules delete <dir> --url <url>
@@ -209,17 +221,23 @@ With no dir-spec, `update` walks `ROOT` in **dependency order** (topological
 sort over `.gitmodules` URLs that resolve to other clones under the same
 `ROOT`).
 
+**dir-spec** = which parent clones. **`--module`** = which first-level gitlinks
+inside each parent (exact `.gitmodules` name or path).  
+`--module '!a+!b'` = every first-level module except those.
+
+---
+
 #### `submodules details`
 
 Not an alias of `list`. First-level only. Read-only (shadow-fetch tags; no
-checkout, no commit).
+checkout, no commit). `DRY_RUN` does not apply.
 
 | Column | Meaning |
 |--------|---------|
 | **NAME** | `.gitmodules` name |
 | **URL** | clone URL |
 | **PIN** | current tag, `branch=`, or `sha:……` |
-| **LATEST** | newest recognised release in that module (`git_pin_latest_recognised`) |
+| **LATEST** | newest recognised release (`git_pin_latest_recognised`) |
 
 A `(semver)` suffix is added only when the ref text is **not** already that
 semver (`1.0.1` stays `1.0.1`; `v2.0.0` becomes `v2.0.0 (2.0.0)`).
@@ -228,6 +246,10 @@ Unclassified pins print the raw ref with no parentheses.
 `--all` prints, under each row, tags that are ancestors of `origin/master` or
 `origin/main` (wrapped) and origin / shadow branches. The current pin is
 marked with `*` in those lists.
+
+`--module` filters rows. Without it, every first-level module is shown.
+
+---
 
 #### `submodules update` policy (1.1.0)
 
@@ -240,13 +262,17 @@ checked out in the module:
 | Case | Condition | Action |
 |------|-----------|--------|
 | **A** | `branch=master` | Float to `origin/master`. Already at that SHA → *No changes* |
-| **B1** | no master; checkout is a recognised release tag | Jump to the **latest** tag in the same family (same prefix and grain). Same tag, different SHA → re-release |
-| **B2** | no master; checkout is **not** a tag (e.g. `branch=master` was removed) | Pin the latest tag of the inferred family. A downgrade is intentional. If no family, the newest recognised release |
+| **B1** | no master; checkout is a recognised release tag | Jump to the **latest** tag in the same family. Same tag, different SHA → re-release |
+| **B2** | no master; checkout is **not** a tag | Pin the latest tag of the inferred family. A downgrade is intentional. If no family, the newest recognised release |
 | **UNRESOLVED** | pin not recognised | On a TTY you can type a ref; `--confirm` / non-TTY skips that row |
 
 `--latest` keeps A / B1 / B2, but PLANNED is the newest recognised release
-**in that module**, including a new major (`1.0.1` → `2.0.0`). Default stays
-in-family so a 2.x pin is never a surprise.
+**in that module**, including a new major. Default stays in-family.
+
+`--tag <tag>` requires a **positive** `--module` (not `!…`). That row pins the
+exact tag (character match) and **ignores** family policy and `--latest`.
+
+Rows not selected by `--module` still appear in the plan as *No changes*.
 
 Families (prefix + grain), extended in `git.sh`:
 
@@ -267,6 +293,8 @@ Before applying:
 
 `DRY_RUN=1` prints the plan and does not touch the tree.
 
+---
+
 ### Repos
 
 ```bash
@@ -283,6 +311,8 @@ argument splits the dump into chunks of that many KiB.
 
 `status` reports `OK`, `DIRTY`, `UNPUSHED`, or `DIRTY+UNPUSHED`.
 `push` is a plain `git push` (no `--force`); skips repos with no upstream.
+
+---
 
 ### Releases
 
@@ -303,6 +333,8 @@ DRY_RUN=1 StormByte-GitHub repos release database 1.0.0
 | `--delete <dir> <version>` | Remove Release + tag (local and `origin`) after typing `yes`. No-op if neither exists. `--skip-ci` is ignored |
 | Create (default) `<dir> <version>` | Clean tree on `master`/`main`, OWNER remote, non-empty `## [<version>] - YYYY-MM-DD` section in `CHANGELOG.md`. Notes come from that section. Waits for CI unless `--skip-ci` (Ctrl-C during the wait: no tag yet). Same version deletes and recreates. Pre-releases (`1.0.0-rc.1`) use `gh --prerelease`. Confirmation must be exactly `yes` |
 
+---
+
 ### Fork
 
 ```bash
@@ -317,6 +349,8 @@ FORK_ROOT=~/Forks StormByte-GitHub fork branch-status
 | `sync` | update **only** `master` when behind upstream; refuses if the remote is not a fork |
 | `branch-status` | local branches ≠ `master`: `CLEAN` / `CONFLICTS` merging into `master` (`merge-tree`). Notes local-only or origin-divergent tips |
 
+---
+
 ### Search and clone
 
 ```bash
@@ -327,6 +361,8 @@ StormByte-GitHub clone-all
 
 `clone-all` clones every **public** `$OWNER` repository missing under `$ROOT`.
 Existing folders are left alone.
+
+---
 
 ### Test
 
@@ -372,7 +408,8 @@ Section headers stay blue/cyan. Everything else uses a short palette:
 
 After installing the completion file, Tab completes commands, subcommands,
 dir-specs (root basenames, `./…`, absolute paths), flags (`--confirm`,
-`--latest`, `--all`, …), and release-version hints read from `CHANGELOG.md`.
+`--latest`, `--all`, `--module`, `--tag`, …), and release-version hints read
+from `CHANGELOG.md`.
 
 ---
 
@@ -381,11 +418,11 @@ dir-specs (root basenames, `./…`, absolute paths), flags (`--confirm`,
 - Repositories must belong to the configured **OWNER** (or the `OWNER=` override).
 - Omitting the dir-spec walks only **immediate** subdirectories of the effective
   root (not a recursive `find`).
+- `dir-spec` selects parent clones; `--module` selects first-level gitlinks.
+- `--tag` wins over `--latest` and over A/B1/B2 on that row.
 - `submodules update` floats to `master` **only** when the parent declares
-  `branch=master`. Removing that line is the signal to pin a tag (case B2),
-  even if that means a downgrade. Crossing a major takes `--latest`.
-- `git sync` / `git pull` do not change first-level pin policy; they update
-  the superproject and align nested modules to what is already recorded.
+  `branch=master`. Removing that line is the signal to pin a tag (case B2).
+- `git sync` / `git pull` do not change first-level pin policy.
 - Use `DRY_RUN=1` before a bulk `cache delete`, `repos release --delete`, or
   a wide `git reset`.
 

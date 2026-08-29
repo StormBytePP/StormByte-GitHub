@@ -120,7 +120,10 @@ Most commands accept an optional
 .IR dir-spec .
 The argument is always a
 .B local directory
-(clone path), never the GitHub repository name.
+(clone path), never the GitHub repository name
+and never a submodule name.
+Module filters use
+.BR --module .
 .TP
 (no argument)
 Every immediate subdirectory of the effective root
@@ -246,7 +249,7 @@ Print name, path and URL from
 (or
 .RI `` none '').
 .TP
-.B submodules details\fR [\fIdir-spec\fR] [\fB--all\fR]
+.B submodules details\fR [\fIdir-spec\fR] [\fB--all\fR] [\fB--module\fR \fIspec\fR]
 Read-only report of
 .B first-level
 modules.
@@ -282,12 +285,23 @@ or
 The current pin is marked with
 .B *
 in those lists.
-No checkout, no stash, no commit.
+.sp
+.B --module \fIname-or-path
+only that first-level module (exact
+.B .gitmodules
+name or path).
+.B --module '!a+!b'
+every first-level module except those names/paths.
+Without
+.B --module
+every first-level module is shown.
 A missing work tree prints
 .B \(em
 for PIN / LATEST.
+.B DRY_RUN
+does not apply.
 .TP
-.B submodules update\fR [\fIdir-spec\fR] [\fB--confirm\fR] [\fB--latest\fR]
+.B submodules update\fR [\fIdir-spec\fR] [\fB--confirm\fR] [\fB--latest\fR] [\fB--module\fR \fIspec\fR] [\fB--tag\fR \fItag\fR]
 Re-pin
 .B first-level
 modules only.
@@ -300,7 +314,34 @@ are walked in dependency order
 URLs that resolve to other clones under
 .BR ROOT ).
 .sp
-Policy (parent
+.B dir-spec
+selects parent clones.
+.B --module
+selects gitlinks inside each visited parent
+(exact name or path;
+.B '!a+!b'
+excludes).
+Rows not selected still appear in the plan as
+.IR "No changes" ,
+even if family policy would have moved them.
+.sp
+.B --tag \fItag
+requires a
+.B positive
+.B --module
+(not an exclusion).
+That row pins the tag with a character-exact match and
+.B ignores
+family policy and
+.BR --latest .
+If the tag does not exist,
+.BR UNRESOLVED .
+.B DRY_RUN=1
+prints the plan and does not checkout.
+.sp
+Policy without
+.B --tag
+(parent
 .I .gitmodules
 .B branch=
 plus the module checkout), implemented via
@@ -339,7 +380,9 @@ keeps A / B1 / B2, but PLANNED for B1 and B2 is the newest recognised
 release
 .B in that module
 , including a new major.
-Default stays in-family.
+Ignored on a
+.B --tag
+row.
 .IP \(bu 2
 Unrecognised pins \(->
 .BR UNRESOLVED .
@@ -755,10 +798,13 @@ StormByte-GitHub submodules update
 StormByte-GitHub submodules update database
 StormByte-GitHub submodules update database --confirm
 StormByte-GitHub submodules update network --latest
-DRY_RUN=1 StormByte-GitHub submodules update
-StormByte-GitHub submodules list crypto
 StormByte-GitHub submodules details network
-StormByte-GitHub submodules details network --all
+StormByte-GitHub submodules details --module 'StormByte BuildMaster'
+StormByte-GitHub submodules details network --module 'StormByte BuildMaster' --all
+StormByte-GitHub submodules update --module 'StormByte BuildMaster'
+StormByte-GitHub submodules update --module 'StormByte BuildMaster' --tag 2.0.0
+DRY_RUN=1 StormByte-GitHub submodules update --module 'StormByte BuildMaster'
+StormByte-GitHub submodules list crypto
 StormByte-GitHub submodules add database https://github.com/example/lib.git thirdparty/lib --name lib
 StormByte-GitHub submodules delete database --name lib
 
@@ -824,6 +870,16 @@ environment override).
 Omitting the dir-spec walks every immediate subdirectory of the effective
 root.
 .IP \(bu 2
+.B dir-spec
+selects parent clones;
+.B --module
+selects first-level gitlinks.
+.IP \(bu 2
+.B --tag
+wins over
+.B --latest
+and over A/B1/B2 on that row.
+.IP \(bu 2
 .B git pull
 /
 .B git sync
@@ -839,7 +895,10 @@ from
 is the explicit signal for case B2, including an intentional downgrade
 onto a release tag.
 Crossing a major on purpose takes
-.BR "update --latest" .
+.BR "update --latest"
+unless
+.B --tag
+is given.
 .IP \(bu 2
 .B DRY_RUN=1
 is recommended before a bulk
