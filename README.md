@@ -5,7 +5,7 @@
 [![Bash](https://img.shields.io/badge/bash-5%2B-4EAA25?logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
 [![GitHub CLI](https://img.shields.io/badge/gh-required-2088FF?logo=github&logoColor=white)](https://cli.github.com/)
 [![helpers bash](https://img.shields.io/badge/functions.sh-%E2%89%A5%201.3.0-555)](https://github.com/StormBytePP/StormByte.Repository)
-[![helpers git](https://img.shields.io/badge/git.sh-%E2%89%A5%201.3.0-555)](https://github.com/StormBytePP/StormByte.Repository)
+[![helpers git](https://img.shields.io/badge/git.sh-%E2%89%A5%201.3.1-555)](https://github.com/StormBytePP/StormByte.Repository)
 [![Changelog](https://img.shields.io/badge/changelog-Keep%20a%20Changelog-E05735)](CHANGELOG.md)
 [![Pages](https://img.shields.io/github/actions/workflow-status/StormBytePP/StormByte-GitHub/jekyll-gh-pages.yml?label=docs)](https://github.com/StormBytePP/StormByte-GitHub/actions/workflows/jekyll-gh-pages.yml)
 
@@ -24,7 +24,7 @@ source dumps, releases, forks, search/clone helpers, and sanitizer test drivers.
 | **Cache** | `show` / `list` / `delete` GitHub Actions caches; optional `--name` glob |
 | **CI** | `stop` / `start` / `restart` / `status` of workflow runs; `--failed` |
 | **Git** | `reset` (hard + clean + submodules), `pull` / `sync` (rebase **without** re-pinning first-level modules) |
-| **Submodules** | `init` / `deinit` / `update` / `list` / `add` / `delete`. First-level update follows policy A / B1 / B2; `--latest` may cross major; nested modules stay on SHAs recorded by the parent |
+| **Submodules** | `init` / `deinit` / `update` / `list` / `details` / `add` / `delete`. First-level update follows A / B1 / B2; `--latest` may cross major; `details` reports PIN vs newest release |
 | **Repos** | inventory, source dump, status, push, release (create / list / delete) |
 | **Fork** | `status` / `sync` / `branch-status` under optional `FORK_ROOT` |
 | **Search / clone** | code search and `clone-all` for the configured owner |
@@ -44,7 +44,7 @@ apply without editing the config file.
 - **git** with submodule support
 - **StormByte helpers**
   - `StormByte-functions-bash` ≥ **1.3.0** (`functions.sh`)
-  - `StormByte-functions-git` ≥ **1.3.0** (`git.sh`)  
+  - `StormByte-functions-git` ≥ **1.3.1** (`git.sh`)  
   Default locations: next to the script, or `/lib/StormByte/functions.sh` and
   `/lib/StormByte/git.sh`
 
@@ -188,12 +188,14 @@ ROOT=~/Software StormByte-GitHub git sync '!multimedia'
 
 ```bash
 StormByte-GitHub submodules list
+StormByte-GitHub submodules details
+StormByte-GitHub submodules details network
+StormByte-GitHub submodules details network --all
 StormByte-GitHub submodules init
 StormByte-GitHub submodules deinit
 StormByte-GitHub submodules update
 StormByte-GitHub submodules update multimedia --confirm
 StormByte-GitHub submodules update network --latest
-StormByte-GitHub submodules update network --latest --confirm
 StormByte-GitHub submodules add <dir> <URL> <path> --name <name>
 StormByte-GitHub submodules delete <dir> --name <name>
 StormByte-GitHub submodules delete <dir> --url <url>
@@ -206,6 +208,26 @@ selector, removes the folder, and does not commit or push.
 With no dir-spec, `update` walks `ROOT` in **dependency order** (topological
 sort over `.gitmodules` URLs that resolve to other clones under the same
 `ROOT`).
+
+#### `submodules details`
+
+Not an alias of `list`. First-level only. Read-only (shadow-fetch tags; no
+checkout, no commit).
+
+| Column | Meaning |
+|--------|---------|
+| **NAME** | `.gitmodules` name |
+| **URL** | clone URL |
+| **PIN** | current tag, `branch=`, or `sha:……` |
+| **LATEST** | newest recognised release in that module (`git_pin_latest_recognised`) |
+
+A `(semver)` suffix is added only when the ref text is **not** already that
+semver (`1.0.1` stays `1.0.1`; `v2.0.0` becomes `v2.0.0 (2.0.0)`).
+Unclassified pins print the raw ref with no parentheses.
+
+`--all` prints, under each row, tags that are ancestors of `origin/master` or
+`origin/main` (wrapped) and origin / shadow branches. The current pin is
+marked with `*` in those lists.
 
 #### `submodules update` policy (1.1.0)
 
@@ -224,8 +246,7 @@ checked out in the module:
 
 `--latest` keeps A / B1 / B2, but PLANNED is the newest recognised release
 **in that module**, including a new major (`1.0.1` → `2.0.0`). Default stays
-in-family so a 2.x pin is never a surprise. The helper is
-`git_pin_latest_recognised` in `git.sh`.
+in-family so a 2.x pin is never a surprise.
 
 Families (prefix + grain), extended in `git.sh`:
 
@@ -341,7 +362,7 @@ Section headers stay blue/cyan. Everything else uses a short palette:
 | Colour | Use |
 |--------|-----|
 | Dark green | idle / *No changes* / OK with no work |
-| Light green (bold) | planned or applied update |
+| Light green (bold) | planned or applied update; PIN ≠ LATEST in `details` |
 | Yellow | warnings (`DIRTY`, `UNPUSHED`, unresolved prompts, …) |
 | Red | failures, `DIRTY+UNPUSHED`, `CONFLICTS`, error rows |
 
@@ -351,7 +372,7 @@ Section headers stay blue/cyan. Everything else uses a short palette:
 
 After installing the completion file, Tab completes commands, subcommands,
 dir-specs (root basenames, `./…`, absolute paths), flags (`--confirm`,
-`--latest`, …), and release-version hints read from `CHANGELOG.md`.
+`--latest`, `--all`, …), and release-version hints read from `CHANGELOG.md`.
 
 ---
 

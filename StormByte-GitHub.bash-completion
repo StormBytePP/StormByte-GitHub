@@ -42,7 +42,7 @@ _StormByte_GitHub() {
 
 	cache_subs=(show list delete)
 	ci_subs=(stop start restart status)
-	submodules_subs=(init deinit update list add delete)
+	submodules_subs=(init deinit update list details add delete)
 	git_subs=(reset pull sync)
 	repos_subs=(list dump status push release)
 	fork_subs=(status sync branch-status)
@@ -422,6 +422,17 @@ _StormByte_GitHub() {
 			_sb_complete_repo_spec "$cur" "$SB_GH_ROOT"
 			local -a extra=()
 			mapfile -t extra < <(compgen -W "--confirm --latest" -- "$cur")
+			COMPREPLY+=("${extra[@]}")
+			return 0
+			;;
+		details)
+			if [[ "$cur" == -* ]]; then
+				mapfile -t COMPREPLY < <(compgen -W "--all" -- "$cur")
+				return 0
+			fi
+			_sb_complete_repo_spec "$cur" "$SB_GH_ROOT"
+			local -a extra=()
+			mapfile -t extra < <(compgen -W "--all" -- "$cur")
 			COMPREPLY+=("${extra[@]}")
 			return 0
 			;;

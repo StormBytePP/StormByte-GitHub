@@ -6,7 +6,7 @@ set -euo pipefail
 
 readonly STORMBYTE_GITHUB_VERSION="1.1.0"
 readonly REQUIRE_STORMBYTE_FUNCTIONS="1.3.0"
-readonly REQUIRE_STORMBYTE_FUNCTIONS_GIT="1.3.0"
+readonly REQUIRE_STORMBYTE_FUNCTIONS_GIT="1.3.1"
 readonly REQUIRE_STORMBYTE_FUNCTIONS_GH="1.0.0"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -281,34 +281,40 @@ ${_CLR_BOLD_CYAN}ci stop|start|restart|status${_CLR_RESET}  [dir-spec] [--failed
 	Manage workflow runs.
 	--failed   Only re-run failed/cancelled/timed_out runs
 
-${_CLR_BOLD_CYAN}submodules init|deinit|update|list${_CLR_RESET}  [dir-spec] [--confirm] [--latest]
-    Submodule operations (update walks ROOT in dependency order).
-    init    git submodule update --init --recursive
-    deinit  git submodule deinit --all -f
-    list    name, path and URL from .gitmodules (or "none").
-    update  First-level modules only; nested ones stay on the SHAs
-            recorded by their parent after the roots are staged.
+${_CLR_BOLD_CYAN}submodules init|deinit|update|list|details${_CLR_RESET}  [dir-spec] [--confirm] [--latest] [--all]
+	Submodule operations (update walks ROOT in dependency order).
+	init     git submodule update --init --recursive
+	deinit   git submodule deinit --all -f
+	list     name, path and URL from .gitmodules (or "none").
+	details  First-level only (not list). Columns: NAME, URL, PIN, LATEST.
+			LATEST is the newest recognised release in the module
+			(same criterion as update --latest). A (semver) suffix is
+			added only when the ref text is not already that semver.
+			Read-only: shadow-fetch tags, no checkout, no commit.
+			--all  after each row, list tags that are ancestors of
+			origin/master or origin/main (wrapped) and origin branches.
+			The current pin is marked with * in those lists.
+	update   First-level modules only; nested ones stay on the SHAs
+			recorded by their parent after the roots are staged.
 
-            Policy (branch= in .gitmodules of the parent):
-            A  branch=master
-                Float to origin/master. Already at that SHA → No changes.
-            B1 no master, checkout is a recognised release tag
-                Move to the latest tag in the same family (same prefix and
-                grain: postgres REL_<major>, Crypto++ CRYPTOPP_<X.Y>,
-                own libs X.Y). Same tag, different SHA → re-release.
-            B2 no master, checkout is not a tag (e.g. master was removed)
-                Pin to the latest tag of the inferred family (intentional
-                downgrade is allowed). Else the newest recognised release.
-            Unrecognised pins → UNRESOLVED. On a TTY you can type a ref;
-            --confirm / non-TTY skips those rows.
+			Policy (branch= in .gitmodules of the parent):
+			A  branch=master
+				Float to origin/master. Already at that SHA → No changes.
+			B1 no master, checkout is a recognised release tag
+				Move to the latest tag in the same family (same prefix and
+				grain: postgres REL_<major>, Crypto++ CRYPTOPP_<X.Y>,
+				own libs X.Y). Same tag, different SHA → re-release.
+			B2 no master, checkout is not a tag (e.g. master was removed)
+				Pin to the latest tag of the inferred family (intentional
+				downgrade is allowed). Else the newest recognised release.
+			Unrecognised pins → UNRESOLVED. On a TTY you can type a ref;
+			--confirm / non-TTY skips those rows.
+			--latest  B1 and B2 use the newest recognised release in the
+			module, including a new major. Default stays in-family.
 
-            --latest  B1 and B2 use the newest recognised release in the
-            module, including a new major (1.0.1 → 2.0.0). Default stays
-            in-family so a major pin is never a surprise.
-
-            Prints MODULE / CURRENT / PLANNED, then asks [y/N] unless
-            --confirm or DRY_RUN=1. Parent dirty tree is stashed and restored.
-            Commits "chore: update dependencies" locally (no push).
+			Prints MODULE / CURRENT / PLANNED, then asks [y/N] unless
+			--confirm or DRY_RUN=1. Parent dirty tree is stashed and restored.
+			Commits "chore: update dependencies" locally (no push).
 
 ${_CLR_BOLD_CYAN}submodules add${_CLR_RESET}  <dir> <URL> <path> --name <name>
 	Add a submodule (no init/update after). --name anywhere; path relative, no '..'.
@@ -340,18 +346,28 @@ ${_CLR_BOLD_CYAN}repos release${_CLR_RESET}  [dir-spec] [version] [--list | --de
 
 	${_CLR_BOLD}--list${_CLR_RESET} (dir and version optional)
 	List GitHub Releases (not plain tags).
-	If <version> is given, only that release is shown.
-	Tags without a matching GitHub Release are a note, not an error.
+	Directory selection works like other commands (all under ROOT, one dir,
+	or !exclusions). If <version> is given, only that release is shown.
+	Tags that exist without a matching GitHub Release are reported as a
+	friendly note (not an error).
+	Positional parsing when --list is present:
+		(none)              → all repos, all releases
+		<dir-spec>          → selected repos, all releases
+		<version>           → all repos, that version only (SEMVER-shaped)
+		<dir-spec> <version>→ selected repos, that version only
 
 	${_CLR_BOLD}--delete${_CLR_RESET}  <dir> <version>
 	Remove GitHub Release and tag (local + origin). Confirm with yes.
+	--skip-ci is ignored. No-op if neither exists.
 
 	${_CLR_BOLD}CREATE${_CLR_RESET} (default)  <dir> <version> [--skip-ci]
 	Tag, push and create a GitHub Release.
 	Requires clean tree on master/main, OWNER remote, and CHANGELOG.md with:
 		## [<version>] - YYYY-MM-DD
-	Waits for CI unless --skip-ci. Same version recreates tag/release.
-	Pre-releases use --prerelease. Confirmation is exactly "yes".
+	Notes come from that section. Waits for CI unless --skip-ci
+	(Ctrl-C during wait: no tag yet). Same version recreates tag/release.
+	Pre-releases (e.g. 1.0.0-rc.1) use gh --prerelease.
+	Interactive confirmation (type yes). DRY_RUN supported for create/delete.
 
 ${_CLR_BOLD_CYAN}clone-all${_CLR_RESET}
 	Clone all public repositories of \$OWNER that are missing under \$ROOT.
@@ -364,12 +380,69 @@ ${_CLR_BOLD_CYAN}fork status|sync|branch-status${_CLR_RESET}  [dir-spec]
 	status         → behind/ahead vs upstream (forks)
 	sync           → update ONLY master if behind upstream
 	branch-status  → local branches ≠ master: CLEAN/CONFLICTS vs merge into master
-					(merge-tree; local-only if not pushed)
+					(merge-tree; NOTE: local-only if not pushed; neutral if none)
 
-${_CLR_BOLD_CYAN}test asan|tsan${_CLR_RESET}  [dir-spec] [options]
-	Configure + build + run sanitizer tests. Build dir must not already exist
-	and is removed on exit. Options: --builddir --testdir --outfile
-	--cmake-options --executable --test --asan-options --tsan-options --verbose
+${_CLR_BOLD_CYAN}test asan|tsan${_CLR_RESET}  [dir-spec]
+	Build and run AddressSanitizer / ThreadSanitizer tests.
+	Supports the same directory selection as other multi-repo commands
+	(all, one, or !exclusions). Relative paths resolve under \$ROOT;
+	absolute and ~/ paths are used as-is.
+
+	The build directory is created by the script and always removed at the end
+	(success or failure). If the build directory already exists the command
+	aborts for safety for that repository.
+
+	Options:
+	--builddir DIR          Build directory relative to repo root
+							(default: build-asan / build-tsan)
+	--testdir DIR           Directory for ctest (default: \$builddir/test)
+	--outfile FILE          Report file (default: /tmp/<repo>_asan|tsan_report.txt)
+							Only written when an error occurs.
+	--cmake-options "opts"  Extra options passed to cmake (after sanitizer flags)
+	--executable PATH       Run this binary directly (relative to builddir or absolute)
+	--test REGEX            Run ctest -R REGEX instead of all tests
+	--asan-options "opts"   Extra ASAN_OPTIONS (only for asan)
+	--tsan-options "opts"   Extra TSAN_OPTIONS (only for tsan)
+	--verbose               Show full configure + compile output
+
+	Execution priority (per repository):
+	1. --executable  → run the binary directly
+	2. --test        → ctest -R REGEX
+	3. (none)        → ctest (all tests)
+
+${_CLR_BOLD}EXAMPLES${_CLR_RESET}
+${SCRIPT_NAME} cache delete '!multimedia'
+${SCRIPT_NAME} ci start --failed
+${SCRIPT_NAME} repos list
+${SCRIPT_NAME} repos dump ./base type=cmake 200
+${SCRIPT_NAME} repos status
+${SCRIPT_NAME} repos push '!multimedia'
+${SCRIPT_NAME} repos release --list
+${SCRIPT_NAME} repos release database --list
+${SCRIPT_NAME} repos release --list 1.0.0
+${SCRIPT_NAME} repos release database 1.0.0 --list
+${SCRIPT_NAME} repos release database 1.0.0
+${SCRIPT_NAME} repos release database 1.0.0 --skip-ci
+${SCRIPT_NAME} repos release database 1.0.0 --delete
+DRY_RUN=1 ${SCRIPT_NAME} repos release database 1.0.0
+ROOT=~/Software ${SCRIPT_NAME} git sync
+${SCRIPT_NAME} submodules details network
+${SCRIPT_NAME} submodules details network --all
+${SCRIPT_NAME} submodules update network --latest
+FORK_ROOT=~/Forks ${SCRIPT_NAME} fork status
+FORK_ROOT=~/Forks ${SCRIPT_NAME} fork sync
+${SCRIPT_NAME} search \"mimalloc\"
+${SCRIPT_NAME} clone-all
+${SCRIPT_NAME} test asan
+${SCRIPT_NAME} test asan multimedia
+${SCRIPT_NAME} test tsan '!multimedia'
+${SCRIPT_NAME} test asan database --cmake-options \"-DENABLE_FOO=ON\" --verbose
+${SCRIPT_NAME} test asan multimedia --executable bin/my_test --outfile /tmp/report.txt
+
+${_CLR_BOLD}NOTES${_CLR_RESET}
+• Repositories must belong to the configured OWNER (or OWNER env override).
+• Omitting the dir-spec walks every immediate subdirectory of the effective root.
+• Running with no arguments shows this help.
 EOF
 }
 
@@ -1327,6 +1400,138 @@ cmd_submodules_delete() {
 	ok "Submodule removed (not committed)"
 }
 
+_sm_details_wrap() {
+	local indent="$1"
+	shift
+	local width=72
+	local col=${#indent} word shown line=""
+
+	if [[ $# -eq 0 ]]; then
+		printf '%s%s\n' "$indent" "—"
+		return 0
+	fi
+	line="$indent"
+	col=${#indent}
+	for word in "$@"; do
+		shown="$word"
+		if (( col + ${#shown} + 2 > width && col > ${#indent} )); then
+			printf '%s\n' "$line"
+			line="${indent}${shown}"
+			col=$(( ${#indent} + ${#shown} ))
+		else
+			if [[ "$line" == "$indent" ]]; then
+				line="${indent}${shown}"
+				col=$(( ${#indent} + ${#shown} ))
+			else
+				line="${line}  ${shown}"
+				col=$((col + 2 + ${#shown}))
+			fi
+		fi
+	done
+	printf '%s\n' "$line"
+}
+
+cmd_submodules_details_one() {
+	local dir="$1" repo="$2"
+	local sm_name sm_path sm_url abs
+	local name url pin_shown latest_shown pin_raw latest_raw
+	local tag br shown count=0
+	local -a shadow_repos=() tags=() branches=() wrap_items=()
+	local prefix="${GIT_SHADOW_TAGS:-refs/sb-gh/tags}"
+
+	_sm_details_cleanup() {
+		local r
+		for r in "${shadow_repos[@]}"; do
+			git_shadow_delete "$r"
+		done
+	}
+
+	info "Path" "$dir"
+	info "Remote" "$repo"
+	LAST_COUNT=0
+
+	if ! git_has_submodules "$dir"; then
+		info "Submodules" "none"
+		return 0
+	fi
+
+	printf "  ${_CLR_DIM}%-28s  %-36s  %-18s  %s${_CLR_RESET}\n" \
+		"NAME" "URL" "PIN" "LATEST"
+
+	while IFS=$'\t' read -r sm_name sm_path sm_url; do
+		[[ -z "$sm_name" || -z "$sm_path" ]] && continue
+		abs="$dir/$sm_path"
+		if [[ ! -d "$abs" ]]; then
+			warn "missing work tree for $sm_path"
+			printf "  %-28s  %-36s  %-18s  %s\n" "$sm_name" "$sm_url" "—" "—"
+			count=$((count + 1))
+			continue
+		fi
+
+		shadow_repos+=("$abs")
+		if ! git_shadow_fetch "$abs"; then
+			warn "shadow fetch failed for $sm_path"
+		fi
+
+		IFS=$'\t' read -r name url pin_shown latest_shown pin_raw latest_raw \
+			< <(git_sm_details_line "$dir" "$sm_name" "$abs")
+
+		if [[ -n "$latest_raw" && "$pin_raw" != "$latest_raw" ]]; then
+			latest_shown="$(_clr_wrap "${_CLR_BOLD_GREEN}" "$latest_shown")"
+		else
+			latest_shown="$(_clr_wrap "${_CLR_GREEN}" "$latest_shown")"
+		fi
+
+		printf "  %-28s  %-36s  %-18s  %s\n" \
+			"$name" "$url" "$pin_shown" "$latest_shown"
+		count=$((count + 1))
+
+		if [[ "${SM_ALL:-0}" != "1" ]]; then
+			continue
+		fi
+
+		mapfile -t tags < <(git_sm_details_trunk_tags "$abs" "$prefix")
+		wrap_items=()
+		if ((${#tags[@]} == 0)); then
+			printf "      ${_CLR_DIM}tags on master${_CLR_RESET}\n"
+			_sm_details_wrap "          "
+		else
+			printf "      ${_CLR_DIM}tags on master${_CLR_RESET}\n"
+			for tag in "${tags[@]}"; do
+				shown="$(git_pin_display_label "$tag")"
+				if [[ "$tag" == "$pin_raw" ]]; then
+					shown="*$shown"
+					shown="$(_clr_wrap "${_CLR_BOLD_GREEN}" "$shown")"
+				fi
+				wrap_items+=("$shown")
+			done
+			_sm_details_wrap "          " "${wrap_items[@]}"
+		fi
+
+		mapfile -t branches < <(git_sm_details_origin_branches "$abs")
+		wrap_items=()
+		printf "      ${_CLR_DIM}branches${_CLR_RESET}\n"
+		if ((${#branches[@]} == 0)); then
+			_sm_details_wrap "          "
+		else
+			for br in "${branches[@]}"; do
+				shown="$br"
+				if [[ "$br" == "$pin_raw" ]]; then
+					shown="*$shown"
+					shown="$(_clr_wrap "${_CLR_BOLD_GREEN}" "$shown")"
+				fi
+				wrap_items+=("$shown")
+			done
+			_sm_details_wrap "          " "${wrap_items[@]}"
+		fi
+	done < <(git_gitmodules_list "$dir")
+
+	_sm_details_cleanup
+	info "Count" "$count"
+	ok "Details for $count submodule(s)"
+	LAST_COUNT=$count
+}
+
 cmd_submodules() {
 	local sub="${1:-}"
 	shift || true
@@ -1336,15 +1541,21 @@ cmd_submodules() {
 
 	if [[ -z "$sub" ]]; then
 		usage_error "Missing submodules subcommand" \
-			"submodules init|deinit|update|list [dir-spec] [--confirm] [--latest] | add … | delete …"
+			"submodules init|deinit|update|list|details [dir-spec] [--confirm] [--latest] [--all] | add … | delete …"
 	fi
 
 	SM_CONFIRM=0
 	SM_LATEST=0
+	SM_ALL=0
 	for arg in "$@"; do
 		case "$arg" in
 			--confirm) SM_CONFIRM=1 ;;
 			--latest)  SM_LATEST=1 ;;
+			--all)     SM_ALL=1 ;;
+			-*)
+				usage_error "Unknown option: $arg" \
+					"submodules ${sub} [dir-spec] [--confirm] [--latest] [--all]"
+				;;
 			*) rest+=("$arg") ;;
 		esac
 	done
@@ -1394,6 +1605,10 @@ cmd_submodules() {
 			foreach_repo cmd_submodules_list_one "$target"
 			print_summary "submodules listed" "$__walk_total"
 			;;
+		details)
+			foreach_repo cmd_submodules_details_one "$target"
+			print_summary "submodules detailed" "$__walk_total"
+			;;
 		add)
 			cmd_submodules_add "$@"
 			;;
@@ -1402,7 +1617,7 @@ cmd_submodules() {
 			;;
 		*)
 			usage_error "Unknown submodules subcommand: $sub" \
-				"submodules init|deinit|update|list [dir-spec] [--confirm] [--latest] | add … | delete …"
+				"submodules init|deinit|update|list|details [dir-spec] [--confirm] [--latest] [--all] | add … | delete …"
 			;;
 	esac
 }

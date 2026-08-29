@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `submodules update --latest`: plan the newest recognised release in the
   module (may cross major). Default stays in-family (B1 / B2).
+- `submodules details` [dir-spec] [--all]: first-level NAME / URL / PIN /
+  LATEST. LATEST is the newest recognised release (`git_pin_latest_recognised`).
+  `(semver)` only when the ref text is not already that semver. `--all` lists
+  tags on master/main and origin branches; current pin marked with `*`.
 
 [Unreleased]: https://github.com/StormBytePP/StormByte-GitHub/compare/1.1.0...HEAD
 
