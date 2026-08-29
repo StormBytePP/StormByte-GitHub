@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `submodules update --latest`: plan the newest recognised release in the
+  module (may cross major). Default stays in-family (B1 / B2).
+
 [Unreleased]: https://github.com/StormBytePP/StormByte-GitHub/compare/1.1.0...HEAD
 
 ## [1.1.0] - 2026-08-28

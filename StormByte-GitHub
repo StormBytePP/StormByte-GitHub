@@ -281,29 +281,34 @@ ${_CLR_BOLD_CYAN}ci stop|start|restart|status${_CLR_RESET}  [dir-spec] [--failed
 	Manage workflow runs.
 	--failed   Only re-run failed/cancelled/timed_out runs
 
-${_CLR_BOLD_CYAN}submodules init|deinit|update|list${_CLR_RESET}  [dir-spec] [--confirm]
-	Submodule operations (update walks ROOT in dependency order).
-	init    git submodule update --init --recursive
-	deinit  git submodule deinit --all -f
-	list    name, path and URL from .gitmodules (or "none").
-	update  First-level modules only; nested ones stay on the SHAs
-			recorded by their parent after the roots are staged.
+${_CLR_BOLD_CYAN}submodules init|deinit|update|list${_CLR_RESET}  [dir-spec] [--confirm] [--latest]
+    Submodule operations (update walks ROOT in dependency order).
+    init    git submodule update --init --recursive
+    deinit  git submodule deinit --all -f
+    list    name, path and URL from .gitmodules (or "none").
+    update  First-level modules only; nested ones stay on the SHAs
+            recorded by their parent after the roots are staged.
 
-			Policy (branch= in .gitmodules of the parent):
-			A  branch=master
-				Float to origin/master. Already at that SHA → No changes.
-			B1 no master, checkout is a recognised release tag
-				Move to the latest tag in the same family (same prefix and
-				grain: postgres REL_<major>, Crypto++ CRYPTOPP_<X.Y>,
-				own libs X.Y). Same tag, different SHA → re-release.
-			B2 no master, checkout is not a tag (e.g. master was removed)
-				Pin to the latest tag of the inferred family (intentional
-				downgrade is allowed). Else the newest recognised release.
-			Unrecognised pins → UNRESOLVED and are skipped.
+            Policy (branch= in .gitmodules of the parent):
+            A  branch=master
+                Float to origin/master. Already at that SHA → No changes.
+            B1 no master, checkout is a recognised release tag
+                Move to the latest tag in the same family (same prefix and
+                grain: postgres REL_<major>, Crypto++ CRYPTOPP_<X.Y>,
+                own libs X.Y). Same tag, different SHA → re-release.
+            B2 no master, checkout is not a tag (e.g. master was removed)
+                Pin to the latest tag of the inferred family (intentional
+                downgrade is allowed). Else the newest recognised release.
+            Unrecognised pins → UNRESOLVED. On a TTY you can type a ref;
+            --confirm / non-TTY skips those rows.
 
-			Prints MODULE / CURRENT / PLANNED, then asks [y/N] unless
-			--confirm or DRY_RUN=1. Parent dirty tree is stashed and restored.
-			Commits "chore: update dependencies" locally (no push).
+            --latest  B1 and B2 use the newest recognised release in the
+            module, including a new major (1.0.1 → 2.0.0). Default stays
+            in-family so a major pin is never a surprise.
+
+            Prints MODULE / CURRENT / PLANNED, then asks [y/N] unless
+            --confirm or DRY_RUN=1. Parent dirty tree is stashed and restored.
+            Commits "chore: update dependencies" locally (no push).
 
 ${_CLR_BOLD_CYAN}submodules add${_CLR_RESET}  <dir> <URL> <path> --name <name>
 	Add a submodule (no init/update after). --name anywhere; path relative, no '..'.
@@ -995,12 +1000,16 @@ commit_submodules_if_needed() {
 
 cmd_submodules_update_one() {
 	local dir="$1" repo="$2"
-	local stashed=0 sm_name sm_path sm_url abs
-	local action kind current planned target sha sha_new
-	local n_upd=0 n_re=0 n_unres=0 n_err=0 i
+	local stashed=0
+	local sm_name sm_path sm_url abs action kind current planned target sha
+	local latest newest reply sha_new got short prefix
+	local n_upd=0 n_re=0 n_unres=0
 	local -a plan_name=() plan_path=() plan_cur=() plan_new=()
 	local -a plan_action=() plan_kind=() plan_target=()
 	local -a shadow_repos=()
+	local plan_line
+
+	prefix="${GIT_SHADOW_TAGS:-refs/sb-gh/tags}"
 
 	_sm_shadow_cleanup() {
 		local r
@@ -1030,29 +1039,86 @@ cmd_submodules_update_one() {
 	while IFS=$'\t' read -r sm_name sm_path sm_url; do
 		[[ -z "$sm_name" || -z "$sm_path" ]] && continue
 		abs="$dir/$sm_path"
+		action="keep"
+		kind="sha"
+		current=""
+		planned="No changes"
+		target=""
+		sha=""
+
 		if [[ "$DRY_RUN" != "1" ]]; then
 			if ! git -C "$dir" submodule update --init -- "$sm_path" >/dev/null 2>&1; then
 				warn "init failed for $sm_path"
 				continue
 			fi
 		fi
+
 		if [[ ! -d "$abs" ]]; then
 			warn "missing work tree for $sm_path"
 			continue
 		fi
-		shadow_repos+=("$abs")
-		git_shadow_fetch "$abs" || warn "shadow fetch failed for $sm_path"
-		git -C "$abs" fetch origin --tags --force --prune >/dev/null 2>&1 || true
-		git -C "$abs" fetch origin master --prune >/dev/null 2>&1 || true
 
-		IFS=$'\t' read -r action kind current planned target sha \
-			< <(git_sm_plan "$dir" "$sm_name" "$abs")
-		case "$action" in
-			update)    n_upd=$((n_upd + 1)) ;;
-			rerelease) n_re=$((n_re + 1)) ;;
-			skip)      n_unres=$((n_unres + 1)) ;;
-			error)     n_err=$((n_err + 1)) ;;
-		esac
+		shadow_repos+=("$abs")
+		if ! git_shadow_fetch "$abs"; then
+			warn "shadow fetch failed for $sm_path"
+		fi
+
+		plan_line="$(git_sm_plan "$dir" "$sm_name" "$abs")" || plan_line=""
+		IFS=$'\t' read -r action kind current planned target sha <<<"$plan_line"
+
+		if [[ "$action" == "error" ]]; then
+			err "${planned:-plan failed} for ${sm_name}"
+			_sm_shadow_cleanup
+			if [[ "$stashed" -eq 1 ]]; then
+				git_stash_pop_safe "$dir" >/dev/null 2>&1 || true
+			fi
+			return 1
+		fi
+
+		if [[ "${SM_LATEST:-0}" == "1" ]]; then
+			newest="$(git_pin_latest_recognised "$abs" "$prefix" 2>/dev/null || true)"
+			if [[ -n "$newest" ]]; then
+				if [[ "$planned" != "$newest" ]]; then
+					action="update"
+					kind="tag"
+					planned="$newest"
+					target="$newest"
+				fi
+			fi
+		elif [[ "$action" == "update" && "$kind" == "tag" && -n "$target" ]]; then
+			latest="$(git_pin_latest_in_family "$abs" "$target" "$prefix" 2>/dev/null || true)"
+			if [[ -n "$latest" ]]; then
+				planned="$latest"
+				target="$latest"
+			fi
+		fi
+
+		if [[ "$action" == "skip" ]]; then
+			reply="$(_sm_prompt_ref "$abs" "${current:-$sm_name}" "${planned:-unresolved}")" || reply=""
+			if [[ -n "$reply" ]]; then
+				if git_peel_ref "$abs" "${GIT_SHADOW_HEADS:-refs/sb-gh/heads}/${reply}" >/dev/null 2>&1 \
+					|| git_peel_ref "$abs" "refs/remotes/origin/${reply}" >/dev/null 2>&1; then
+					action="update"
+					kind="branch"
+					planned="$reply"
+					target="$reply"
+					n_upd=$((n_upd + 1))
+				else
+					action="update"
+					kind="tag"
+					planned="$reply"
+					target="$reply"
+					n_upd=$((n_upd + 1))
+				fi
+			else
+				n_unres=$((n_unres + 1))
+			fi
+		elif [[ "$action" == "update" ]]; then
+			n_upd=$((n_upd + 1))
+		elif [[ "$action" == "rerelease" ]]; then
+			n_re=$((n_re + 1))
+		fi
+
 		plan_name+=("$sm_name")
 		plan_path+=("$sm_path")
 		plan_cur+=("$current")
@@ -1066,23 +1132,35 @@ cmd_submodules_update_one() {
 	for i in "${!plan_name[@]}"; do
 		print_columns "${plan_name[$i]}" "${plan_cur[$i]}" "$(_clr_planned "${plan_new[$i]}")"
 	done
-	info "Plan" "${n_upd} update(s), ${n_re} re-release(s), ${n_unres} unresolved, ${n_err} error(s)"
-	[[ "${SM_CONFIRM:-0}" == "1" ]] && info "Mode" "--confirm"
+
+	info "Plan" "${n_upd} update(s), ${n_re} re-release(s), ${n_unres} unresolved"
+	if [[ "${SM_CONFIRM:-0}" == "1" ]]; then
+		info "Mode" "--confirm"
+	fi
+	if [[ "${SM_LATEST:-0}" == "1" ]]; then
+		info "Mode" "--latest"
+	fi
 
 	if [[ "$DRY_RUN" == "1" ]]; then
 		log "  [dry-run] no checkout"
 		LAST_COUNT=0
 		_sm_shadow_cleanup
-		[[ "$stashed" -eq 1 ]] && git_stash_pop_safe "$dir" >/dev/null 2>&1 || true
+		if [[ "$stashed" -eq 1 ]]; then
+			git_stash_pop_safe "$dir" >/dev/null 2>&1 || true
+		fi
 		return 0
 	fi
 
-	if (( n_upd + n_re > 0 )); then
-		if ! confirm_yes "Apply this plan?"; then
-			warn "Aborted"
-			_sm_shadow_cleanup
-			[[ "$stashed" -eq 1 ]] && git_stash_pop_safe "$dir" >/dev/null 2>&1 || true
-			return 0
+	if [[ "${SM_CONFIRM:-0}" != "1" ]] && is_tty; then
+		if (( n_upd + n_re > 0 )); then
+			if ! confirm_yes "Apply this plan?"; then
+				warn "Aborted"
+				_sm_shadow_cleanup
+				if [[ "$stashed" -eq 1 ]]; then
+					git_stash_pop_safe "$dir" >/dev/null 2>&1 || true
+				fi
+				return 0
+			fi
 		fi
 	fi
 
@@ -1092,23 +1170,29 @@ cmd_submodules_update_one() {
 		target="${plan_target[$i]}"
 		abs="$dir/${plan_path[$i]}"
 		[[ "$action" == "keep" || "$action" == "skip" || -z "$target" ]] && continue
-		if [[ "$action" == "error" ]]; then
-			err "${plan_name[$i]}: ${plan_new[$i]}"
-			continue
-		fi
 		if [[ "$kind" == "branch" ]]; then
-			git_sm_checkout_branch "$abs" "$target" \
-				|| { warn "checkout origin/${target} failed for ${plan_name[$i]}"; continue; }
+			if ! git_sm_checkout_branch "$abs" "$target"; then
+				warn "checkout origin/${target} failed for ${plan_name[$i]}"
+				continue
+			fi
 		else
-			git_sm_checkout_tag "$abs" "$target" \
-				|| { warn "checkout ${target} failed for ${plan_name[$i]}"; continue; }
+			if ! git_sm_checkout_tag "$abs" "$target"; then
+				warn "checkout ${target} failed for ${plan_name[$i]}"
+				continue
+			fi
 		fi
 		sha_new="$(git -C "$abs" rev-parse HEAD)"
-		if ! git_sm_stage_gitlink "$dir" "${plan_path[$i]}" "$sha_new"; then
-			err "gitlink not staged for ${plan_name[$i]}"
+		if ! git -C "$dir" update-index --cacheinfo "160000,${sha_new},${plan_path[$i]}"; then
+			warn "update-index ${plan_path[$i]} failed for ${plan_name[$i]}"
 			continue
 		fi
-		ok "${plan_name[$i]} → $(git_head_sha "$abs") (${plan_new[$i]})"
+		got="$(git -C "$dir" rev-parse ":${plan_path[$i]}" 2>/dev/null || true)"
+		if [[ "$got" != "$sha_new" ]]; then
+			err "gitlink not staged for ${plan_name[$i]} (want ${sha_new:0:7}, index ${got:0:7})"
+			continue
+		fi
+		short="$(git_head_sha "$abs")"
+		ok "${plan_name[$i]} → ${short} (${plan_new[$i]})"
 	done
 
 	info "Nested" "synchronized to recorded SHAs"
@@ -1123,7 +1207,9 @@ cmd_submodules_update_one() {
 	else
 		LAST_COUNT=0
 	fi
+
 	_sm_shadow_cleanup
+
 	if [[ "$stashed" -eq 1 ]]; then
 		log "  Restoring parent stash..."
 		if git_stash_pop_safe "$dir"; then
@@ -1244,30 +1330,35 @@ cmd_submodules_delete() {
 cmd_submodules() {
 	local sub="${1:-}"
 	shift || true
-	local target="" name dir repo arg
+	local target=""
+	local name dir repo arg
 	local -a ordered=() rest=()
 
-	[[ -n "$sub" ]] || usage_error "Missing submodules subcommand" \
-		"submodules init|deinit|update|list [dir-spec] [--confirm] | add … | delete …"
+	if [[ -z "$sub" ]]; then
+		usage_error "Missing submodules subcommand" \
+			"submodules init|deinit|update|list [dir-spec] [--confirm] [--latest] | add … | delete …"
+	fi
 
 	SM_CONFIRM=0
-	case "$sub" in
-		add)    cmd_submodules_add "$@"; return ;;
-		delete) cmd_submodules_delete "$@"; return ;;
-	esac
-
+	SM_LATEST=0
 	for arg in "$@"; do
 		case "$arg" in
 			--confirm) SM_CONFIRM=1 ;;
-			-*) usage_error "Unknown option: $arg" "submodules ${sub} [dir-spec] [--confirm]" ;;
-			*) [[ -z "$target" ]] && target="$arg" ;;
+			--latest)  SM_LATEST=1 ;;
+			*) rest+=("$arg") ;;
 		esac
 	done
+	target="${rest[0]:-}"
 
 	case "$sub" in
-		init)   foreach_repo cmd_submodules_init_one "$target"; print_summary "repos initialized" "$__walk_total" ;;
-		deinit) foreach_repo cmd_submodules_deinit_one "$target"; print_summary "repos deinitialized" "$__walk_total" ;;
-		list)   foreach_repo cmd_submodules_list_one "$target"; print_summary "submodules listed" "$__walk_total" ;;
+		init)
+			foreach_repo cmd_submodules_init_one "$target"
+			print_summary "repos initialized" "$__walk_total"
+			;;
+		deinit)
+			foreach_repo cmd_submodules_deinit_one "$target"
+			print_summary "repos deinitialized" "$__walk_total"
+			;;
 		update)
 			if [[ -n "$target" ]]; then
 				foreach_repo cmd_submodules_update_one "$target"
@@ -1281,6 +1372,7 @@ cmd_submodules() {
 					print_summary "repos updated" 0
 					return 0
 				fi
+				info "Update order" "$(IFS=','; echo "${ordered[*]}")"
 				__walk_repos=0
 				__walk_total=0
 				for name in "${ordered[@]}"; do
@@ -1298,8 +1390,20 @@ cmd_submodules() {
 				print_summary "repos updated" "$__walk_total"
 			fi
 			;;
-		*) usage_error "Unknown submodules subcommand: $sub" \
-			"submodules init|deinit|update|list [dir-spec] [--confirm] | add … | delete …" ;;
+		list)
+			foreach_repo cmd_submodules_list_one "$target"
+			print_summary "submodules listed" "$__walk_total"
+			;;
+		add)
+			cmd_submodules_add "$@"
+			;;
+		delete)
+			cmd_submodules_delete "$@"
+			;;
+		*)
+			usage_error "Unknown submodules subcommand: $sub" \
+				"submodules init|deinit|update|list [dir-spec] [--confirm] [--latest] | add … | delete …"
+			;;
 	esac
 }
 

@@ -416,17 +416,13 @@ _StormByte_GitHub() {
 			;;
 		update)
 			if [[ "$cur" == -* ]]; then
-				if ! _sb_github_has_word --confirm; then
-					mapfile -t COMPREPLY < <(compgen -W "--confirm" -- "$cur")
-				fi
+				mapfile -t COMPREPLY < <(compgen -W "--confirm --latest" -- "$cur")
 				return 0
 			fi
 			_sb_complete_repo_spec "$cur" "$SB_GH_ROOT"
-			if ! _sb_github_has_word --confirm; then
-				local -a extra=()
-				mapfile -t extra < <(compgen -W "--confirm" -- "$cur")
-				COMPREPLY+=("${extra[@]}")
-			fi
+			local -a extra=()
+			mapfile -t extra < <(compgen -W "--confirm --latest" -- "$cur")
+			COMPREPLY+=("${extra[@]}")
 			return 0
 			;;
 		add)

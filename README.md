@@ -24,7 +24,7 @@ source dumps, releases, forks, search/clone helpers, and sanitizer test drivers.
 | **Cache** | `show` / `list` / `delete` GitHub Actions caches; optional `--name` glob |
 | **CI** | `stop` / `start` / `restart` / `status` of workflow runs; `--failed` |
 | **Git** | `reset` (hard + clean + submodules), `pull` / `sync` (rebase **without** re-pinning first-level modules) |
-| **Submodules** | `init` / `deinit` / `update` / `list` / `add` / `delete`. First-level update follows policy A / B1 / B2; nested modules stay on SHAs recorded by the parent |
+| **Submodules** | `init` / `deinit` / `update` / `list` / `add` / `delete`. First-level update follows policy A / B1 / B2; `--latest` may cross major; nested modules stay on SHAs recorded by the parent |
 | **Repos** | inventory, source dump, status, push, release (create / list / delete) |
 | **Fork** | `status` / `sync` / `branch-status` under optional `FORK_ROOT` |
 | **Search / clone** | code search and `clone-all` for the configured owner |
@@ -192,6 +192,8 @@ StormByte-GitHub submodules init
 StormByte-GitHub submodules deinit
 StormByte-GitHub submodules update
 StormByte-GitHub submodules update multimedia --confirm
+StormByte-GitHub submodules update network --latest
+StormByte-GitHub submodules update network --latest --confirm
 StormByte-GitHub submodules add <dir> <URL> <path> --name <name>
 StormByte-GitHub submodules delete <dir> --name <name>
 StormByte-GitHub submodules delete <dir> --url <url>
@@ -219,6 +221,11 @@ checked out in the module:
 | **B1** | no master; checkout is a recognised release tag | Jump to the **latest** tag in the same family (same prefix and grain). Same tag, different SHA → re-release |
 | **B2** | no master; checkout is **not** a tag (e.g. `branch=master` was removed) | Pin the latest tag of the inferred family. A downgrade is intentional. If no family, the newest recognised release |
 | **UNRESOLVED** | pin not recognised | On a TTY you can type a ref; `--confirm` / non-TTY skips that row |
+
+`--latest` keeps A / B1 / B2, but PLANNED is the newest recognised release
+**in that module**, including a new major (`1.0.1` → `2.0.0`). Default stays
+in-family so a 2.x pin is never a surprise. The helper is
+`git_pin_latest_recognised` in `git.sh`.
 
 Families (prefix + grain), extended in `git.sh`:
 
@@ -343,8 +350,8 @@ Section headers stay blue/cyan. Everything else uses a short palette:
 ## Bash completion
 
 After installing the completion file, Tab completes commands, subcommands,
-dir-specs (root basenames, `./…`, absolute paths), flags, and release-version
-hints read from `CHANGELOG.md`.
+dir-specs (root basenames, `./…`, absolute paths), flags (`--confirm`,
+`--latest`, …), and release-version hints read from `CHANGELOG.md`.
 
 ---
 
@@ -355,7 +362,7 @@ hints read from `CHANGELOG.md`.
   root (not a recursive `find`).
 - `submodules update` floats to `master` **only** when the parent declares
   `branch=master`. Removing that line is the signal to pin a tag (case B2),
-  even if that means a downgrade.
+  even if that means a downgrade. Crossing a major takes `--latest`.
 - `git sync` / `git pull` do not change first-level pin policy; they update
   the superproject and align nested modules to what is already recorded.
 - Use `DRY_RUN=1` before a bulk `cache delete`, `repos release --delete`, or
