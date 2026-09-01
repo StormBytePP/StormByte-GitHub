@@ -793,15 +793,21 @@ cmd_ci_start_one() {
 	LAST_COUNT=0
 	info "Remote" "$repo"
 	branch="$(git_current_branch "$dir")"
-	sha="$(git_head_sha_full "$dir")"
-	[[ -z "$branch" || -z "$sha" ]] && { err "Cannot resolve branch/HEAD"; return 1; }
+	[[ -z "$branch" ]] && { err "Cannot resolve current branch"; return 1; }
+
+	sha="$(git -C "$dir" rev-parse --verify "refs/remotes/origin/${branch}" 2>/dev/null || true)"
+	if [[ -z "$sha" ]]; then
+		sha="$(git_head_sha_full "$dir")"
+	fi
+	[[ -z "$sha" ]] && { err "Cannot resolve branch tip SHA"; return 1; }
+
 	info "Branch" "$branch"
-	info "HEAD" "$sha"
+	info "SHA" "$sha"
 	[[ "$ONLY_FAILED" == "1" ]] && info "Filter" "--failed"
 
 	mapfile -t entries < <(gh_run_list_for_start "$repo" "$branch" "$sha" "$PAGE_LIMIT")
 	if [[ ${#entries[@]} -eq 0 ]]; then
-		warn "No workflow runs found"
+		warn "No workflow runs on $branch @ ${sha:0:7}"
 		ok "No workflows re-run"
 		return 0
 	fi
@@ -849,40 +855,134 @@ cmd_ci_start_one() {
 }
 
 cmd_ci_restart_one() {
-	cmd_ci_stop_one "$1" "$2"
-	[[ "$DRY_RUN" != "1" ]] && sleep 2
-	cmd_ci_start_one "$1" "$2"
-}
-
-cmd_ci_status_one() {
-	local dir="$1" repo="$2" branch
-	local id status conclusion workflow title entry rest
+	local dir="$1" repo="$2"
+	local branch cancelled=0 rerun=0 id status workflow title entry rest
 	local -a entries=()
+	local -a rerun_ids=()
+	local -a rerun_names=()
 
 	LAST_COUNT=0
 	info "Remote" "$repo"
 	branch="$(git_current_branch "$dir")"
 	[[ -z "$branch" ]] && { err "Cannot resolve current branch"; return 1; }
 	info "Branch" "$branch"
-	mapfile -t entries < <(gh_run_list_recent "$repo" "$branch" 15)
+
+	mapfile -t entries < <(gh_run_list_active "$repo" "$branch" "$PAGE_LIMIT")
 	if [[ ${#entries[@]} -eq 0 ]]; then
-		_idle "No recent runs"
+		_idle "No active runs on $branch"
 		return 0
 	fi
+	info "Found" "${#entries[@]} unique active run(s)"
+
 	for entry in "${entries[@]}"; do
 		id="${entry%%$'\t'*}"
 		rest="${entry#*$'\t'}"
 		status="${rest%%$'\t'*}"
 		rest="${rest#*$'\t'}"
-		conclusion="${rest%%$'\t'*}"
-		rest="${rest#*$'\t'}"
 		workflow="${rest%%$'\t'*}"
 		title="${rest#*$'\t'}"
-		printf "  %-12s  %-12s  %-20s  %s\n" \
-			"$(_clr_ci_status "$status")" "$(_clr_ci_conclusion "$conclusion")" "$workflow" "$title"
-		LAST_COUNT=$((LAST_COUNT + 1))
+		[[ -z "$id" ]] && continue
+		if [[ "$DRY_RUN" == "1" ]]; then
+			log "  [dry-run] would cancel+rerun: $workflow id=$id"
+			cancelled=$((cancelled + 1))
+			rerun=$((rerun + 1))
+			continue
+		fi
+		log "  cancel: $workflow id=$id"
+		if gh_run_cancel "$repo" "$id"; then
+			cancelled=$((cancelled + 1))
+			rerun_ids+=("$id")
+			rerun_names+=("$workflow")
+		else
+			warn "cancel failed for id=$id"
+		fi
 	done
-	ok "Listed recent runs"
+
+	if [[ "$DRY_RUN" != "1" && ${#rerun_ids[@]} -gt 0 ]]; then
+		sleep 2
+		local i
+		for i in "${!rerun_ids[@]}"; do
+			id="${rerun_ids[$i]}"
+			workflow="${rerun_names[$i]}"
+			log "  Re-run: $workflow id=$id"
+			if gh_run_rerun "$repo" "$id"; then
+				rerun=$((rerun + 1))
+			else
+				warn "rerun failed for id=$id"
+			fi
+		done
+	fi
+
+	LAST_COUNT=$rerun
+	ok "Restarted $rerun workflow run(s) (cancelled=$cancelled)"
+}
+
+cmd_ci_status_one() {
+	local dir="$1" repo="$2" branch sha
+	local id status conclusion head_sha workflow title entry rest
+	local -a entries=()
+	local n_active=0 n_tip=0
+
+	LAST_COUNT=0
+	info "Remote" "$repo"
+	branch="$(git_current_branch "$dir")"
+	[[ -z "$branch" ]] && { err "Cannot resolve current branch"; return 1; }
+
+	sha="$(git -C "$dir" rev-parse --verify "refs/remotes/origin/${branch}" 2>/dev/null || true)"
+	if [[ -z "$sha" ]]; then
+		sha="$(git_head_sha_full "$dir")"
+	fi
+	[[ -z "$sha" ]] && { err "Cannot resolve branch tip SHA"; return 1; }
+
+	info "Branch" "$branch"
+	info "SHA" "$sha"
+
+	mapfile -t entries < <(gh_run_list_active "$repo" "$branch" "$PAGE_LIMIT")
+	if [[ ${#entries[@]} -eq 0 ]]; then
+		_idle "No active runs on $branch"
+	else
+		info "Active" "${#entries[@]} (stop / restart)"
+		printf "  ${_CLR_DIM}%-12s  %-20s  %s${_CLR_RESET}\n" "STATUS" "WORKFLOW" "TITLE"
+		for entry in "${entries[@]}"; do
+			id="${entry%%$'\t'*}"
+			rest="${entry#*$'\t'}"
+			status="${rest%%$'\t'*}"
+			rest="${rest#*$'\t'}"
+			workflow="${rest%%$'\t'*}"
+			title="${rest#*$'\t'}"
+			printf "  %-12s  %-20s  %s\n" \
+				"$(_clr_ci_status "$status")" "$workflow" "$title"
+			n_active=$((n_active + 1))
+		done
+	fi
+
+	mapfile -t entries < <(gh_run_list_for_start "$repo" "$branch" "$sha" "$PAGE_LIMIT")
+	if [[ ${#entries[@]} -eq 0 ]]; then
+		_idle "No workflow runs on $branch @ ${sha:0:7}"
+	else
+		info "Tip" "${#entries[@]} run(s) @ ${sha:0:7} (start)"
+		printf "  ${_CLR_DIM}%-12s  %-12s  %-20s  %s${_CLR_RESET}\n" \
+			"STATUS" "CONCLUSION" "WORKFLOW" "TITLE"
+		for entry in "${entries[@]}"; do
+			id="${entry%%$'\t'*}"
+			rest="${entry#*$'\t'}"
+			status="${rest%%$'\t'*}"
+			rest="${rest#*$'\t'}"
+			conclusion="${rest%%$'\t'*}"
+			rest="${rest#*$'\t'}"
+			head_sha="${rest%%$'\t'*}"
+			rest="${rest#*$'\t'}"
+			workflow="${rest%%$'\t'*}"
+			title="${rest#*$'\t'}"
+			printf "  %-12s  %-12s  %-20s  %s\n" \
+				"$(_clr_ci_status "$status")" "$(_clr_ci_conclusion "$conclusion")" \
+				"$workflow" "$title"
+			n_tip=$((n_tip + 1))
+		done
+	fi
+
+	LAST_COUNT=$((n_active + n_tip))
+	ok "Listed active + tip runs"
 }
 
 cmd_ci() {
