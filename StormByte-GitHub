@@ -4,7 +4,7 @@
 # =============================================================================
 set -euo pipefail
 
-readonly STORMBYTE_GITHUB_VERSION="1.1.0"
+readonly STORMBYTE_GITHUB_VERSION="1.1.1"
 readonly REQUIRE_STORMBYTE_FUNCTIONS="1.3.0"
 readonly REQUIRE_STORMBYTE_FUNCTIONS_GIT="1.3.1"
 readonly REQUIRE_STORMBYTE_FUNCTIONS_GH="1.0.0"
@@ -278,8 +278,15 @@ ${_CLR_BOLD_CYAN}cache show|list|delete${_CLR_RESET}  [dir-spec] [--name <patter
 					(e.g. --name '*ccache*' or --name 'sccache-Windows-*')
 
 ${_CLR_BOLD_CYAN}ci stop|start|restart|status${_CLR_RESET}  [dir-spec] [--failed]
-	Manage workflow runs.
-	--failed   Only re-run failed/cancelled/timed_out runs
+	Workflow runs on the clone's current branch.
+	stop     Cancel every active run on that branch (any SHA).
+	start    Re-run each workflow for origin/<branch> (HEAD if that
+			remote-tracking ref is missing). Fetches origin first.
+			Does not dispatch a workflow that never ran on that SHA.
+	restart  Cancel active runs, then re-run those same run ids
+			(the SHA that was in flight). Not stop+start.
+	status   Active runs (stop set) and runs on the tip SHA (start set).
+	--failed Only start: failure / cancelled / timed_out / startup_failure.
 
 ${_CLR_BOLD_CYAN}submodules init|deinit|update|list|details${_CLR_RESET}  [dir-spec] [--confirm] [--latest] [--all] [--module …] [--tag …]
 	Submodule operations (update walks ROOT in dependency order).
@@ -296,10 +303,11 @@ ${_CLR_BOLD_CYAN}submodules init|deinit|update|list|details${_CLR_RESET}  [dir-s
 	update   First-level modules only; nested ones stay on the SHAs
 			recorded by their parent after the roots are staged.
 			--module / --module '!…' as in details.
-			Rows not selected still appear in the plan as No changes.
+			The plan lists only wanted modules.
 			--tag <tag>  requires a positive --module. That row pins the
 			exact tag (character match) and ignores family / --latest.
 			DRY_RUN=1 prints the plan and does not checkout.
+			Ctrl-C restores the parent stash and drops shadow refs.
 
 			Policy (branch= in .gitmodules of the parent):
 			A  branch=master
@@ -315,7 +323,7 @@ ${_CLR_BOLD_CYAN}submodules init|deinit|update|list|details${_CLR_RESET}  [dir-s
 
 			Prints MODULE / CURRENT / PLANNED, then asks [y/N] unless
 			--confirm or DRY_RUN=1. Commits "chore: update dependencies"
-			locally (no push).
+			locally (no push). With --module the name is appended.
 
 ${_CLR_BOLD_CYAN}submodules add${_CLR_RESET}  <dir> <URL> <path> --name <name>
 	Add a submodule (no init/update after). --name anywhere; path relative, no '..'.
@@ -742,6 +750,55 @@ cmd_cache() {
 # CI
 # =============================================================================
 
+_ci_fetch_origin() {
+	local dir="$1"
+	git -C "$dir" fetch origin --prune >/dev/null 2>&1 || true
+}
+
+_ci_tip_sha() {
+	local dir="$1" branch="$2" sha=""
+	if [[ -n "$branch" && "$branch" != "HEAD" ]]; then
+		sha="$(git -C "$dir" rev-parse --verify "refs/remotes/origin/${branch}" 2>/dev/null || true)"
+	fi
+	if [[ -z "$sha" ]]; then
+		sha="$(git_head_sha_full "$dir")"
+	fi
+	printf '%s' "$sha"
+}
+
+_ci_sha_eq() {
+	local a="${1-}" b="${2-}"
+	[[ -n "$a" && -n "$b" ]] || return 1
+	[[ "$a" == "$b" || "$a" == "$b"* || "$b" == "$a"* ]]
+}
+
+# @brief Active runs on a branch (any SHA). Does not swallow gh failures as "none".
+# @stdout id<TAB>status<TAB>workflow<TAB>title
+_ci_list_active() {
+	local repo="$1" branch="$2" limit="${3:-100}"
+	local json rc=0
+	[[ -n "$repo" && -n "$branch" ]] || return 0
+
+	set +e
+	json="$(gh run list -R "$repo" --branch "$branch" --limit "$limit" \
+		--json databaseId,status,displayTitle,workflowName \
+		2>/dev/null)"
+	rc=$?
+	set -e
+	if [[ "$rc" -ne 0 || -z "$json" ]]; then
+		warn "gh run list failed for $repo ($branch)"
+		return 0
+	fi
+
+	printf '%s\n' "$json" | jq -r '
+		.[]
+		| select(.status as $s
+			| ["in_progress","queued","pending","waiting","requested","action_required"]
+			| index($s))
+		| "\(.databaseId)\t\(.status)\t\(.workflowName // "-")\t\(.displayTitle // "")"
+	'
+}
+
 cmd_ci_stop_one() {
 	local dir="$1" repo="$2"
 	local branch cancelled=0 id status workflow title entry rest
@@ -750,29 +807,32 @@ cmd_ci_stop_one() {
 	LAST_COUNT=0
 	info "Remote" "$repo"
 	branch="$(git_current_branch "$dir")"
-	[[ -z "$branch" ]] && { err "Cannot resolve current branch"; return 1; }
+	[[ -z "$branch" ]] && { err "Cannot resolve current branch (detached HEAD?)"; return 1; }
 	info "Branch" "$branch"
+	_ci_fetch_origin "$dir"
 
-	mapfile -t entries < <(gh_run_list_active "$repo" "$branch" "$PAGE_LIMIT")
-	if [[ ${#entries[@]} -eq 0 ]]; then
+	mapfile -t entries < <(_ci_list_active "$repo" "$branch" "$PAGE_LIMIT")
+	if [[ ${#entries[@]} -eq 0 || -z "${entries[0]:-}" ]]; then
 		_idle "No active runs on $branch"
 		return 0
 	fi
 	info "Found" "${#entries[@]} unique active run(s)"
 
 	for entry in "${entries[@]}"; do
+		[[ -z "$entry" ]] && continue
 		id="${entry%%$'\t'*}"
 		rest="${entry#*$'\t'}"
 		status="${rest%%$'\t'*}"
 		rest="${rest#*$'\t'}"
 		workflow="${rest%%$'\t'*}"
 		title="${rest#*$'\t'}"
+		[[ -z "$id" ]] && continue
 		if [[ "$DRY_RUN" == "1" ]]; then
-			log "  [dry-run] would cancel: $workflow id=$id"
+			log "  [dry-run] would cancel: $workflow id=$id ($status)"
 			cancelled=$((cancelled + 1))
 			continue
 		fi
-		log "  cancel: $workflow id=$id"
+		log "  cancel: $workflow id=$id ($status)"
 		if gh_run_cancel "$repo" "$id"; then
 			cancelled=$((cancelled + 1))
 		else
@@ -793,12 +853,9 @@ cmd_ci_start_one() {
 	LAST_COUNT=0
 	info "Remote" "$repo"
 	branch="$(git_current_branch "$dir")"
-	[[ -z "$branch" ]] && { err "Cannot resolve current branch"; return 1; }
-
-	sha="$(git -C "$dir" rev-parse --verify "refs/remotes/origin/${branch}" 2>/dev/null || true)"
-	if [[ -z "$sha" ]]; then
-		sha="$(git_head_sha_full "$dir")"
-	fi
+	[[ -z "$branch" ]] && { err "Cannot resolve current branch (detached HEAD?)"; return 1; }
+	_ci_fetch_origin "$dir"
+	sha="$(_ci_tip_sha "$dir" "$branch")"
 	[[ -z "$sha" ]] && { err "Cannot resolve branch tip SHA"; return 1; }
 
 	info "Branch" "$branch"
@@ -806,13 +863,14 @@ cmd_ci_start_one() {
 	[[ "$ONLY_FAILED" == "1" ]] && info "Filter" "--failed"
 
 	mapfile -t entries < <(gh_run_list_for_start "$repo" "$branch" "$sha" "$PAGE_LIMIT")
-	if [[ ${#entries[@]} -eq 0 ]]; then
+	if [[ ${#entries[@]} -eq 0 || -z "${entries[0]:-}" ]]; then
 		warn "No workflow runs on $branch @ ${sha:0:7}"
 		ok "No workflows re-run"
 		return 0
 	fi
 
 	for entry in "${entries[@]}"; do
+		[[ -z "$entry" ]] && continue
 		id="${entry%%$'\t'*}"
 		rest="${entry#*$'\t'}"
 		status="${rest%%$'\t'*}"
@@ -824,11 +882,14 @@ cmd_ci_start_one() {
 		workflow="${rest%%$'\t'*}"
 		title="${rest#*$'\t'}"
 		[[ -z "$id" ]] && continue
+		if [[ -n "$head_sha" ]] && ! _ci_sha_eq "$head_sha" "$sha"; then
+			continue
+		fi
 		[[ -n "$workflow" && -n "${seen_workflow[$workflow]+x}" ]] && continue
 		[[ -n "$workflow" ]] && seen_workflow["$workflow"]=1
 		[[ "$RUN_LIMIT" -gt 0 && "$rerun" -ge "$RUN_LIMIT" ]] && break
 		case "$status" in
-			in_progress|queued|pending|waiting|requested)
+			in_progress|queued|pending|waiting|requested|action_required)
 				log "  skip (already active): $workflow"
 				skipped=$((skipped + 1))
 				continue
@@ -857,6 +918,7 @@ cmd_ci_start_one() {
 cmd_ci_restart_one() {
 	local dir="$1" repo="$2"
 	local branch cancelled=0 rerun=0 id status workflow title entry rest
+	local attempt i
 	local -a entries=()
 	local -a rerun_ids=()
 	local -a rerun_names=()
@@ -864,17 +926,19 @@ cmd_ci_restart_one() {
 	LAST_COUNT=0
 	info "Remote" "$repo"
 	branch="$(git_current_branch "$dir")"
-	[[ -z "$branch" ]] && { err "Cannot resolve current branch"; return 1; }
+	[[ -z "$branch" ]] && { err "Cannot resolve current branch (detached HEAD?)"; return 1; }
 	info "Branch" "$branch"
+	_ci_fetch_origin "$dir"
 
-	mapfile -t entries < <(gh_run_list_active "$repo" "$branch" "$PAGE_LIMIT")
-	if [[ ${#entries[@]} -eq 0 ]]; then
+	mapfile -t entries < <(_ci_list_active "$repo" "$branch" "$PAGE_LIMIT")
+	if [[ ${#entries[@]} -eq 0 || -z "${entries[0]:-}" ]]; then
 		_idle "No active runs on $branch"
 		return 0
 	fi
 	info "Found" "${#entries[@]} unique active run(s)"
 
 	for entry in "${entries[@]}"; do
+		[[ -z "$entry" ]] && continue
 		id="${entry%%$'\t'*}"
 		rest="${entry#*$'\t'}"
 		status="${rest%%$'\t'*}"
@@ -888,7 +952,7 @@ cmd_ci_restart_one() {
 			rerun=$((rerun + 1))
 			continue
 		fi
-		log "  cancel: $workflow id=$id"
+		log "  cancel: $workflow id=$id ($status)"
 		if gh_run_cancel "$repo" "$id"; then
 			cancelled=$((cancelled + 1))
 			rerun_ids+=("$id")
@@ -899,17 +963,21 @@ cmd_ci_restart_one() {
 	done
 
 	if [[ "$DRY_RUN" != "1" && ${#rerun_ids[@]} -gt 0 ]]; then
-		sleep 2
-		local i
 		for i in "${!rerun_ids[@]}"; do
 			id="${rerun_ids[$i]}"
 			workflow="${rerun_names[$i]}"
 			log "  Re-run: $workflow id=$id"
-			if gh_run_rerun "$repo" "$id"; then
-				rerun=$((rerun + 1))
-			else
-				warn "rerun failed for id=$id"
-			fi
+			for attempt in 1 2 3 4 5; do
+				if gh_run_rerun "$repo" "$id"; then
+					rerun=$((rerun + 1))
+					break
+				fi
+				if [[ "$attempt" -eq 5 ]]; then
+					warn "rerun failed for id=$id"
+					break
+				fi
+				sleep 2
+			done
 		done
 	fi
 
@@ -926,24 +994,22 @@ cmd_ci_status_one() {
 	LAST_COUNT=0
 	info "Remote" "$repo"
 	branch="$(git_current_branch "$dir")"
-	[[ -z "$branch" ]] && { err "Cannot resolve current branch"; return 1; }
-
-	sha="$(git -C "$dir" rev-parse --verify "refs/remotes/origin/${branch}" 2>/dev/null || true)"
-	if [[ -z "$sha" ]]; then
-		sha="$(git_head_sha_full "$dir")"
-	fi
+	[[ -z "$branch" ]] && { err "Cannot resolve current branch (detached HEAD?)"; return 1; }
+	_ci_fetch_origin "$dir"
+	sha="$(_ci_tip_sha "$dir" "$branch")"
 	[[ -z "$sha" ]] && { err "Cannot resolve branch tip SHA"; return 1; }
 
 	info "Branch" "$branch"
 	info "SHA" "$sha"
 
-	mapfile -t entries < <(gh_run_list_active "$repo" "$branch" "$PAGE_LIMIT")
-	if [[ ${#entries[@]} -eq 0 ]]; then
+	mapfile -t entries < <(_ci_list_active "$repo" "$branch" "$PAGE_LIMIT")
+	if [[ ${#entries[@]} -eq 0 || -z "${entries[0]:-}" ]]; then
 		_idle "No active runs on $branch"
 	else
 		info "Active" "${#entries[@]} (stop / restart)"
 		printf "  ${_CLR_DIM}%-12s  %-20s  %s${_CLR_RESET}\n" "STATUS" "WORKFLOW" "TITLE"
 		for entry in "${entries[@]}"; do
+			[[ -z "$entry" ]] && continue
 			id="${entry%%$'\t'*}"
 			rest="${entry#*$'\t'}"
 			status="${rest%%$'\t'*}"
@@ -957,13 +1023,14 @@ cmd_ci_status_one() {
 	fi
 
 	mapfile -t entries < <(gh_run_list_for_start "$repo" "$branch" "$sha" "$PAGE_LIMIT")
-	if [[ ${#entries[@]} -eq 0 ]]; then
+	if [[ ${#entries[@]} -eq 0 || -z "${entries[0]:-}" ]]; then
 		_idle "No workflow runs on $branch @ ${sha:0:7}"
 	else
-		info "Tip" "${#entries[@]} run(s) @ ${sha:0:7} (start)"
+		info "Tip" "${sha:0:7} (start)"
 		printf "  ${_CLR_DIM}%-12s  %-12s  %-20s  %s${_CLR_RESET}\n" \
 			"STATUS" "CONCLUSION" "WORKFLOW" "TITLE"
 		for entry in "${entries[@]}"; do
+			[[ -z "$entry" ]] && continue
 			id="${entry%%$'\t'*}"
 			rest="${entry#*$'\t'}"
 			status="${rest%%$'\t'*}"
@@ -974,11 +1041,17 @@ cmd_ci_status_one() {
 			rest="${rest#*$'\t'}"
 			workflow="${rest%%$'\t'*}"
 			title="${rest#*$'\t'}"
+			if [[ -n "$head_sha" ]] && ! _ci_sha_eq "$head_sha" "$sha"; then
+				continue
+			fi
 			printf "  %-12s  %-12s  %-20s  %s\n" \
 				"$(_clr_ci_status "$status")" "$(_clr_ci_conclusion "$conclusion")" \
 				"$workflow" "$title"
 			n_tip=$((n_tip + 1))
 		done
+		if [[ "$n_tip" -eq 0 ]]; then
+			_idle "No workflow runs on $branch @ ${sha:0:7}"
+		fi
 	fi
 
 	LAST_COUNT=$((n_active + n_tip))
@@ -1131,7 +1204,8 @@ cmd_submodules_deinit_one() {
 }
 
 commit_submodules_if_needed() {
-	local dir="$1" name
+	local dir="$1" name msg
+	local detail="${2:-}"
 	name="$(basename "$dir")"
 	if ! git_is_dirty "$dir"; then
 		_idle "No changes"
@@ -1149,7 +1223,9 @@ commit_submodules_if_needed() {
 		git -C "$dir" restore --staged . >/dev/null 2>&1 || true
 		return 1
 	fi
-	if ! git -C "$dir" commit -m "chore: update dependencies" >/dev/null; then
+	msg="chore: update dependencies"
+	[[ -n "$detail" ]] && msg="${msg} (${detail})"
+	if ! git -C "$dir" commit -m "$msg" >/dev/null; then
 		err "git commit failed in $name"
 		return 1
 	fi
@@ -1157,17 +1233,20 @@ commit_submodules_if_needed() {
 }
 
 cmd_submodules_update_one() {
-	local dir="$1" repo="$2"
-	local stashed=0
+	local repo="$2"
 	local sm_name sm_path sm_url abs short
 	local action kind current planned target sha
-	local n_upd=0 n_re=0 n_unres=0 n_mod=0 i_mod=0
+	local n_upd=0 n_re=0 n_unres=0 n_mod=0 i_mod=0 applied=0
 	local -a plan_name=() plan_path=() plan_cur=() plan_new=()
 	local -a plan_action=() plan_kind=() plan_target=()
-	local -a shadow_repos=()
 	local i reply sha_new got latest latest_sha prefix tag_sha br_sha pin_label
-	local plan_line pin_id latest_id
+	local plan_line pin_id latest_id commit_detail
 	local heads="${GIT_SHADOW_HEADS:-refs/sb-gh/heads}"
+
+	# EXIT/INT/TERM run after this function's locals are gone (set -u).
+	_sm_update_dir="$1"
+	_sm_update_stashed=0
+	_sm_update_shadow_repos=()
 
 	prefix="${GIT_SHADOW_TAGS:-refs/sb-gh/tags}"
 
@@ -1195,29 +1274,10 @@ cmd_submodules_update_one() {
 
 	_sm_shadow_cleanup() {
 		local r
-		for r in "${shadow_repos[@]}"; do
-			git_shadow_delete "$r"
+		for r in "${_sm_update_shadow_repos[@]:-}"; do
+			[[ -n "$r" ]] && git_shadow_delete "$r"
 		done
-		shadow_repos=()
-	}
-
-	_sm_cheap_current() {
-		local repo="$1" out kind label sha
-		[[ -d "$repo" ]] || { printf '%s' ""; return 0; }
-		IFS=$'\t' read -r kind label sha < <(git_sm_classify "$dir" "$sm_name" "$repo" 2>/dev/null || true)
-		sha="$(_sm_trim "$sha")"
-		label="$(_sm_trim "$label")"
-		if [[ "$kind" == "tag" || "$kind" == "branch" ]] && [[ -n "$label" ]]; then
-			if [[ -n "$sha" ]]; then
-				printf '%s (%s)' "$label" "${sha:0:7}"
-			else
-				printf '%s' "$label"
-			fi
-		elif [[ -n "$sha" ]]; then
-			printf 'sha:%s' "${sha:0:7}"
-		else
-			printf '%s' ""
-		fi
+		_sm_update_shadow_repos=()
 	}
 
 	_sm_cleanup_on_exit() {
@@ -1225,50 +1285,50 @@ cmd_submodules_update_one() {
 		trap - EXIT INT TERM
 		_sm_hint_clear
 		_sm_shadow_cleanup
-		if [[ "$stashed" -eq 1 ]]; then
+		if [[ "${_sm_update_stashed:-0}" -eq 1 && -n "${_sm_update_dir:-}" ]]; then
 			log "  Restoring parent stash..."
-			if git_stash_pop_safe "$dir"; then
+			if git_stash_pop_safe "$_sm_update_dir"; then
 				ok "Parent stash restored"
 			else
 				warn "stash pop had conflicts. Parent changes remain in the stash (git stash list)."
 				warn "Resolve them, then: git stash drop"
 			fi
-			stashed=0
+			_sm_update_stashed=0
 		fi
 		return "$rc"
 	}
 	trap '_sm_cleanup_on_exit' EXIT INT TERM
 
-	info "Path" "$dir"
+	info "Path" "$_sm_update_dir"
 	info "Remote" "$repo"
 	LAST_COUNT=0
 
-	if [[ ! -f "$dir/.gitmodules" ]]; then
+	if [[ ! -f "$_sm_update_dir/.gitmodules" ]]; then
 		_idle "No .gitmodules — nothing to update"
 		return 0
 	fi
 
 	if [[ "$DRY_RUN" != "1" ]]; then
-		if git_stash_if_dirty "$dir" "StormByte-GitHub auto-stash before submodules update"; then
-			stashed=1
+		if git_stash_if_dirty "$_sm_update_dir" "StormByte-GitHub auto-stash before submodules update"; then
+			_sm_update_stashed=1
 			ok "Parent changes stashed"
 		fi
 	fi
 
-	git -C "$dir" fetch origin --prune >/dev/null 2>&1 || true
+	git -C "$_sm_update_dir" fetch origin --prune >/dev/null 2>&1 || true
 
 	n_mod=0
 	while IFS=$'\t' read -r sm_name sm_path sm_url; do
 		[[ -z "$sm_name" || -z "$sm_path" ]] && continue
 		_sm_module_wanted "$sm_name" "$sm_path" || continue
 		n_mod=$((n_mod + 1))
-	done < <(git_gitmodules_list "$dir")
+	done < <(git_gitmodules_list "$_sm_update_dir")
 	(( n_mod == 0 )) && n_mod=1
 
 	i_mod=0
 	while IFS=$'\t' read -r sm_name sm_path sm_url; do
 		[[ -z "$sm_name" || -z "$sm_path" ]] && continue
-		abs="$dir/$sm_path"
+		abs="$_sm_update_dir/$sm_path"
 		action="keep"
 		kind="sha"
 		current=""
@@ -1290,7 +1350,7 @@ cmd_submodules_update_one() {
 		_sm_hint "$sm_name" "$i_mod" "$n_mod"
 
 		if [[ "$DRY_RUN" != "1" ]]; then
-			if ! git -C "$dir" submodule update --init -- "$sm_path" >/dev/null 2>&1; then
+			if ! git -C "$_sm_update_dir" submodule update --init -- "$sm_path" >/dev/null 2>&1; then
 				_sm_hint_clear
 				warn "init failed for $sm_path"
 				continue
@@ -1303,13 +1363,13 @@ cmd_submodules_update_one() {
 			continue
 		fi
 
-		shadow_repos+=("$abs")
+		_sm_update_shadow_repos+=("$abs")
 		if ! git_shadow_fetch "$abs"; then
 			_sm_hint_clear
 			warn "shadow fetch failed for $sm_path"
 		fi
 
-		plan_line="$(git_sm_plan "$dir" "$sm_name" "$abs")" || plan_line=""
+		plan_line="$(git_sm_plan "$_sm_update_dir" "$sm_name" "$abs")" || plan_line=""
 		IFS=$'\x1f' read -r action kind current planned target sha _ <<<"${plan_line//$'\t'/$'\x1f'}"
 		action="$(_sm_trim "$action")"
 		kind="$(_sm_trim "$kind")"
@@ -1452,8 +1512,14 @@ cmd_submodules_update_one() {
 		plan_action+=("$action")
 		plan_kind+=("$kind")
 		plan_target+=("$target")
-	done < <(git_gitmodules_list "$dir")
+	done < <(git_gitmodules_list "$_sm_update_dir")
 	_sm_hint_clear
+
+	if [[ ${#plan_name[@]} -eq 0 ]]; then
+		warn "No matching first-level modules"
+		LAST_COUNT=0
+		return 0
+	fi
 
 	print_columns --header MODULE CURRENT PLANNED
 	for i in "${!plan_name[@]}"; do
@@ -1487,7 +1553,7 @@ cmd_submodules_update_one() {
 		action="${plan_action[$i]}"
 		kind="${plan_kind[$i]}"
 		target="${plan_target[$i]}"
-		abs="$dir/${plan_path[$i]}"
+		abs="$_sm_update_dir/${plan_path[$i]}"
 		[[ "$action" == "keep" || "$action" == "skip" || -z "$target" ]] && continue
 		if [[ "$kind" == "branch" ]]; then
 			if ! git_sm_checkout_branch "$abs" "$target"; then
@@ -1501,27 +1567,32 @@ cmd_submodules_update_one() {
 			fi
 		fi
 		sha_new="$(git -C "$abs" rev-parse HEAD)"
-		if ! git -C "$dir" update-index --cacheinfo "160000,${sha_new},${plan_path[$i]}"; then
+		if ! git -C "$_sm_update_dir" update-index --cacheinfo "160000,${sha_new},${plan_path[$i]}"; then
 			warn "update-index ${plan_path[$i]} failed for ${plan_name[$i]}"
 			continue
 		fi
-		got="$(git -C "$dir" rev-parse ":${plan_path[$i]}" 2>/dev/null || true)"
+		got="$(git -C "$_sm_update_dir" rev-parse ":${plan_path[$i]}" 2>/dev/null || true)"
 		if [[ "$got" != "$sha_new" ]]; then
 			err "gitlink not staged for ${plan_name[$i]} (want ${sha_new:0:7}, index ${got:0:7})"
 			continue
 		fi
 		short="$(git_head_sha "$abs")"
 		ok "${plan_name[$i]} → ${short} (${plan_new[$i]})"
+		applied=$((applied + 1))
 	done
 
-	info "Nested" "synchronized to recorded SHAs"
-	if git_sm_update_nested "$dir" >/dev/null 2>&1; then
-		ok "Nested submodules synchronized to recorded SHAs"
-	else
-		warn "nested submodule update had errors (pins may be incomplete)"
+	if (( applied > 0 )); then
+		info "Nested" "synchronized to recorded SHAs"
+		if git_sm_update_nested "$_sm_update_dir" >/dev/null 2>&1; then
+			ok "Nested submodules synchronized to recorded SHAs"
+		else
+			warn "nested submodule update had errors (pins may be incomplete)"
+		fi
 	fi
 
-	if commit_submodules_if_needed "$dir"; then
+	commit_detail=""
+	[[ -n "${SM_MODULE:-}" ]] && commit_detail="$SM_MODULE"
+	if commit_submodules_if_needed "$_sm_update_dir" "$commit_detail"; then
 		LAST_COUNT=1
 	else
 		LAST_COUNT=0
@@ -1722,15 +1793,26 @@ cmd_submodules_details_one() {
 	local sm_name sm_path sm_url abs
 	local name url pin_shown latest_shown pin_raw latest_raw
 	local tag br shown count=0 matched=0 seed
-	local -a shadow_repos=() tags=() branches=() wrap_items=()
+	local tags=() branches=() wrap_items=()
 	local prefix="${GIT_SHADOW_TAGS:-refs/sb-gh/tags}"
+
+	_sm_details_shadow_repos=()
 
 	_sm_details_cleanup() {
 		local r
-		for r in "${shadow_repos[@]}"; do
-			git_shadow_delete "$r"
+		for r in "${_sm_details_shadow_repos[@]:-}"; do
+			[[ -n "$r" ]] && git_shadow_delete "$r"
 		done
+		_sm_details_shadow_repos=()
 	}
+
+	_sm_details_on_exit() {
+		local rc=$?
+		trap - EXIT INT TERM
+		_sm_details_cleanup
+		return "$rc"
+	}
+	trap '_sm_details_on_exit' EXIT INT TERM
 
 	info "Path" "$dir"
 	info "Remote" "$repo"
@@ -1758,7 +1840,7 @@ cmd_submodules_details_one() {
 			continue
 		fi
 
-		shadow_repos+=("$abs")
+		_sm_details_shadow_repos+=("$abs")
 		if ! git_shadow_fetch "$abs"; then
 			warn "shadow fetch failed for $sm_path"
 		fi
@@ -1818,8 +1900,6 @@ cmd_submodules_details_one() {
 			_sm_details_wrap "          " "${wrap_items[@]}"
 		fi
 	done < <(git_gitmodules_list "$dir")
-
-	_sm_details_cleanup
 
 	if [[ -n "${SM_MODULE:-}" && "$matched" -eq 0 ]]; then
 		warn "No first-level module named or pathed '${SM_MODULE}'"

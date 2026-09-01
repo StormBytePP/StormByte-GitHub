@@ -6,6 +6,7 @@
 [![GitHub CLI](https://img.shields.io/badge/gh-required-2088FF?logo=github&logoColor=white)](https://cli.github.com/)
 [![helpers bash](https://img.shields.io/badge/functions.sh-%E2%89%A5%201.3.0-555)](https://github.com/StormBytePP/StormByte.Repository)
 [![helpers git](https://img.shields.io/badge/git.sh-%E2%89%A5%201.3.1-555)](https://github.com/StormBytePP/StormByte.Repository)
+[![helpers gh](https://img.shields.io/badge/gh.sh-%E2%89%A5%201.0.0-555)](https://github.com/StormBytePP/StormByte.Repository)
 [![Changelog](https://img.shields.io/badge/changelog-Keep%20a%20Changelog-E05735)](CHANGELOG.md)
 [![Pages](https://img.shields.io/github/actions/workflow-status/StormBytePP/StormByte-GitHub/jekyll-gh-pages.yml?label=docs)](https://github.com/StormBytePP/StormByte-GitHub/actions/workflows/jekyll-gh-pages.yml)
 
@@ -13,7 +14,7 @@ Unified Bash CLI for day-to-day work across many local GitHub clones under one
 root directory: Actions caches, CI runs, git operations, pin-aware submodules,
 source dumps, releases, forks, search/clone helpers, and sanitizer test drivers.
 
-**Version 1.1.0** · License: MIT
+**Version 1.1.1** · License: MIT
 
 ---
 
@@ -22,12 +23,12 @@ source dumps, releases, forks, search/clone helpers, and sanitizer test drivers.
 | Area | Capabilities |
 |------|----------------|
 | **Cache** | `show` / `list` / `delete` GitHub Actions caches; optional `--name` glob |
-| **CI** | `stop` / `start` / `restart` / `status` of workflow runs; `--failed` |
+| **CI** | `stop` / `start` / `restart` / `status` on the current branch. `stop` cancels any SHA; `start` re-runs the fetched `origin/<branch>` tip; `restart` re-runs the cancelled run ids |
 | **Git** | `reset` (hard + clean + submodules), `pull` / `sync` (rebase **without** re-pinning first-level modules) |
 | **Submodules** | `init` / `deinit` / `update` / `list` / `details` / `add` / `delete`. Update follows A / B1 / B2; `--latest` may cross major; `--module` / `--tag` filter or pin one gitlink; `details` reports PIN vs newest release |
 | **Repos** | inventory, source dump, status, push, release (create / list / delete) |
 | **Fork** | `status` / `sync` / `branch-status` under optional `FORK_ROOT` |
-| **Search / clone** | code search and `clone-all` for the configured owner |
+| **Search / clone** | local code search and `clone-all` for the configured owner |
 | **Test** | `asan` / `tsan` via CMake + ctest or a binary |
 | **Dir-spec** | parent clones under the root, a single path, or exclusions (`!name`, `!a+!b`). Never a submodule name (`--module` does that) |
 
@@ -42,11 +43,10 @@ apply without editing the config file.
 - **[GitHub CLI](https://cli.github.com/)** (`gh`), authenticated for API work
 - **jq**
 - **git** with submodule support
-- **StormByte helpers**
+- **StormByte helpers** (next to the script, or `/lib/StormByte/`)
   - `StormByte-functions-bash` ≥ **1.3.0** (`functions.sh`)
-  - `StormByte-functions-git` ≥ **1.3.1** (`git.sh`)  
-  Default locations: next to the script, or `/lib/StormByte/functions.sh` and
-  `/lib/StormByte/git.sh`
+  - `StormByte-functions-git` ≥ **1.3.1** (`git.sh`)
+  - `StormByte-functions-gh` ≥ **1.0.0** (`gh.sh`)
 
 Optional: `rg` (ripgrep) for `search` (falls back to `grep`).
 
@@ -169,9 +169,17 @@ StormByte-GitHub ci start --failed
 StormByte-GitHub ci restart multimedia
 ```
 
-`stop` cancels active runs (`in_progress` / `queued` / `pending` / `waiting` /
-`requested`) on the current branch. `start` re-runs finished workflows
-(deduplicated by workflow name). `restart` = stop + pause + start.
+All four subcommands use the clone's **current branch** and refuse a detached
+HEAD. They `git fetch origin --prune` first so `origin/<branch>` is current.
+
+| Subcommand | Behaviour |
+|------------|-----------|
+| `stop` | Cancel every **active** run on that branch (`in_progress` / `queued` / `pending` / `waiting` / `requested`), any SHA |
+| `start` | Re-run each workflow for the tip SHA (`origin/<branch>`, else local HEAD). Deduplicated by workflow name. Ignores runs whose `headSha` is not that tip. Does **not** dispatch a workflow that never ran on that SHA (`gh run rerun` needs an existing run). `--failed` keeps `failure` / `cancelled` / `timed_out` / `startup_failure`. Active runs (including `action_required`) are skipped |
+| `restart` | Cancel active runs, then re-run **those same run ids** (the SHA that was in flight). Retries `gh run rerun` if GitHub has not finished the cancel. **Not** stop + start. `--failed` is ignored |
+| `status` | Active runs (stop / restart set) and runs on the tip SHA (start set) |
+
+`--failed` is only applied by `start`. Detached HEAD is an error.
 
 ---
 
@@ -230,7 +238,8 @@ inside each parent (exact `.gitmodules` name or path).
 #### `submodules details`
 
 Not an alias of `list`. First-level only. Read-only (shadow-fetch tags; no
-checkout, no commit). `DRY_RUN` does not apply.
+checkout, no commit). `DRY_RUN` does not apply. Ctrl-C drops shadow refs
+(`refs/sb-gh/*`).
 
 | Column | Meaning |
 |--------|---------|
@@ -251,10 +260,11 @@ marked with `*` in those lists.
 
 ---
 
-#### `submodules update` policy (1.1.0)
+#### `submodules update` policy
 
 Only **first-level** modules are re-pinned. Nested modules stay on the SHAs
-the parent has just staged.
+the parent has just staged, and the nested sync runs **only if** at least one
+first-level pin was applied.
 
 The decision uses `branch=` in the parent's `.gitmodules` **and** what is
 checked out in the module:
@@ -271,8 +281,10 @@ checked out in the module:
 
 `--tag <tag>` requires a **positive** `--module` (not `!…`). That row pins the
 exact tag (character match) and **ignores** family policy and `--latest`.
+`--branch` is the same shape for an exact branch name.
 
-Rows not selected by `--module` still appear in the plan as *No changes*.
+The plan lists **only** wanted modules. Zero matches is a warning, not a table
+of *No changes* for the rest of the tree.
 
 Families (prefix + grain), extended in `git.sh`:
 
@@ -282,14 +294,17 @@ Families (prefix + grain), extended in `git.sh`:
 
 Before applying:
 
-1. If the parent is dirty, stash it (restored at the end; a conflicted pop
-   leaves the stash in place).
-2. Print the `MODULE / CURRENT / PLANNED` table.
+1. If the parent is dirty, stash it. EXIT / INT / TERM (including Ctrl-C)
+   restores the stash and drops shadow refs. A conflicted pop leaves the stash
+   in place.
+2. Print the `MODULE / CURRENT / PLANNED` table (wanted rows only).
 3. On a TTY, without `--confirm`, and if there is work, ask `[y/N]`.
    `--confirm` or non-TTY applies the plan (UNRESOLVED rows skipped).
 4. Checkout (`origin/<branch>` or tag), stage the gitlink with
-   `update-index --cacheinfo 160000`, **then** sync nested modules to those SHAs.
-5. Local commit `chore: update dependencies`. **No push.**
+   `update-index --cacheinfo 160000`, **then** sync nested modules to those SHAs
+   if anything was applied.
+5. Local commit `chore: update dependencies` (with `--module`, the name is
+   appended in parentheses). **No push.**
 
 `DRY_RUN=1` prints the plan and does not touch the tree.
 
@@ -359,6 +374,7 @@ StormByte-GitHub search "mimalloc" '!thirdparty'
 StormByte-GitHub clone-all
 ```
 
+`search` is local to the selected clones (not GitHub code search).
 `clone-all` clones every **public** `$OWNER` repository missing under `$ROOT`.
 Existing folders are left alone.
 
@@ -423,6 +439,9 @@ from `CHANGELOG.md`.
 - `submodules update` floats to `master` **only** when the parent declares
   `branch=master`. Removing that line is the signal to pin a tag (case B2).
 - `git sync` / `git pull` do not change first-level pin policy.
+- `ci start` re-runs an existing run on the fetched tip. It does not create
+  the first run of a new workflow.
+- `ci restart` re-runs the cancelled ids; it does not retarget the current tip.
 - Use `DRY_RUN=1` before a bulk `cache delete`, `repos release --delete`, or
   a wide `git reset`.
 

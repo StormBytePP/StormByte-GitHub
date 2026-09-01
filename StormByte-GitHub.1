@@ -1,4 +1,4 @@
-.TH STORMBYTE-GITHUB 1 "August 2026" "StormByte-GitHub 1.1.0" "User Commands"
+.TH STORMBYTE-GITHUB 1 "September 2026" "StormByte-GitHub 1.1.1" "User Commands"
 .SH NAME
 StormByte-GitHub \- unified CLI for GitHub Actions caches, CI runs, git ops, pin-aware submodules, dumps, releases, forks and sanitizer tests
 .SH SYNOPSIS
@@ -17,15 +17,18 @@ re-pinning and details, source dumps, GitHub Releases, fork sync, code search,
 clone-all and AddressSanitizer / ThreadSanitizer test builds.
 .PP
 Version
-.BR 1.1.0
+.BR 1.1.1
 requires
 .B StormByte-functions-bash
 \(>= 1.3.0
-.RI ( functions.sh )
-and
+.RI ( functions.sh ),
 .B StormByte-functions-git
 \(>= 1.3.1
-.RI ( git.sh ).
+.RI ( git.sh )
+and
+.B StormByte-functions-gh
+\(>= 1.0.0
+.RI ( gh.sh ).
 .PP
 A configuration file
 .I ~/.StormByte-GitHub.conf
@@ -201,38 +204,70 @@ uses bash glob syntax
 .BR 'sccache-Windows-*' ).
 The flag may appear anywhere after the subcommand.
 .SS ci
+All four subcommands operate on the clone's
+.B current branch
+and refuse a detached HEAD.
+They
+.B git fetch origin --prune
+first so
+.B origin/<branch>
+is current.
 .TP
 .B ci stop\fR [\fIdir-spec\fR]
-Cancel unique active workflow runs
+Cancel every
+.B active
+workflow run on that branch
 .RB ( in_progress ,
 .BR queued ,
 .BR pending ,
 .BR waiting ,
-.BR requested )
-on the current branch.
+.BR requested ),
+any SHA.
 .TP
 .B ci start\fR [\fIdir-spec\fR] [\fB--failed\fR]
-Re-run the latest finished run of each workflow
-(deduplicated by workflow name).
-With
+Re-run each workflow for the tip SHA:
+.B origin/<branch>
+if that remote-tracking ref exists, otherwise local HEAD.
+Deduplicated by workflow name.
+Rows whose
+.B headSha
+is not that tip are ignored
+(the helper may fall back to the whole branch; the script does not).
+Does
+.B not
+dispatch a workflow that has never run on that SHA
+.RB ( gh run rerun
+needs an existing run).
+.sp
 .B --failed
-only
+keeps only
 .BR failure ,
 .BR cancelled ,
 .B timed_out
 and
-.B startup_failure
-runs are re-launched.
-Already-active workflows are skipped.
+.BR startup_failure .
+Already-active workflows
+(including
+.BR action_required )
+are skipped.
+.B --failed
+is ignored by stop / restart / status.
 .TP
-.B ci restart\fR [\fIdir-spec\fR] [\fB--failed\fR]
-.B ci stop
-, a short pause, then
-.BR "ci start" .
+.B ci restart\fR [\fIdir-spec\fR]
+Cancel every active run on the branch, then
+.B re-run those same run ids
+(the SHA that was in flight).
+Retries
+.B gh run rerun
+a few times if GitHub has not yet marked the cancel complete.
+This is
+.B not
+stop + start.
 .TP
 .B ci status\fR [\fIdir-spec\fR]
-Recent runs on the current branch
-(STATUS, CONCLUSION, WORKFLOW, TITLE).
+Two sets on the current branch:
+active runs (what stop / restart touch) and runs on the tip SHA
+(what start would re-run).
 .SS submodules
 .TP
 .B submodules init\fR [\fIdir-spec\fR]
@@ -295,17 +330,19 @@ every first-level module except those names/paths.
 Without
 .B --module
 every first-level module is shown.
-A missing work tree prints
-.B \(em
-for PIN / LATEST.
+A missing work tree prints em-dash for PIN / LATEST.
 .B DRY_RUN
 does not apply.
+Ctrl-C drops shadow refs
+.RB ( refs/sb-gh/* ).
 .TP
 .B submodules update\fR [\fIdir-spec\fR] [\fB--confirm\fR] [\fB--latest\fR] [\fB--module\fR \fIspec\fR] [\fB--tag\fR \fItag\fR]
 Re-pin
 .B first-level
 modules only.
-Nested modules are then synced to the SHAs the parent has just staged.
+Nested modules are synced to the SHAs the parent has just staged,
+.B only if
+at least one first-level pin was applied.
 When no directory is given, parents under
 .B ROOT
 are walked in dependency order
@@ -321,9 +358,11 @@ selects gitlinks inside each visited parent
 (exact name or path;
 .B '!a+!b'
 excludes).
-Rows not selected still appear in the plan as
-.IR "No changes" ,
-even if family policy would have moved them.
+The plan lists
+.B only
+wanted modules.
+Zero matches is a warning, not a table of
+.IR "No changes" .
 .sp
 .B --tag \fItag
 requires a
@@ -336,6 +375,9 @@ family policy and
 .BR --latest .
 If the tag does not exist,
 .BR UNRESOLVED .
+.B --branch
+is the same shape (exact branch, requires positive
+.BR --module ).
 .B DRY_RUN=1
 prints the plan and does not checkout.
 .sp
@@ -419,7 +461,9 @@ Before any checkout:
 .IP \(bu 2
 If the parent worktree is dirty it is stashed
 .RI ( "StormByte-GitHub auto-stash before submodules update" )
-and restored at the end.
+and restored on EXIT, INT or TERM
+(including Ctrl-C).
+Shadow refs are dropped on the same trap.
 A conflicted
 .B stash pop
 leaves the stash in place.
@@ -453,7 +497,10 @@ the nested
 so children see the new parent pins,
 and a local commit
 .B chore: update dependencies
-is created if the index is dirty.
+is created if the index is dirty
+(with
+.B --module
+the module name is appended in parentheses).
 There is
 .B no push
 .
@@ -790,7 +837,9 @@ StormByte-GitHub cache list
 StormByte-GitHub cache list --name '*ccache*'
 StormByte-GitHub cache show multimedia --name 'sccache-Windows-*'
 StormByte-GitHub cache delete '!multimedia'
+StormByte-GitHub ci status
 StormByte-GitHub ci start --failed
+StormByte-GitHub ci restart multimedia
 
 # Git / submodules
 ROOT=~/Software StormByte-GitHub git sync
@@ -859,6 +908,16 @@ and
 Same search path as
 .IR functions.sh .
 Required version \(>= 1.3.1.
+.TP
+.I gh.sh
+GitHub CLI wrappers
+.RB ( gh_run_list_active ,
+.BR gh_run_list_for_start ,
+.BR gh_run_rerun ,
+.BR gh_run_cancel ,
+... ).
+Same search path.
+Required version \(>= 1.0.0.
 .SH NOTES
 .IP \(bu 2
 Repositories must belong to the configured
@@ -899,6 +958,15 @@ Crossing a major on purpose takes
 unless
 .B --tag
 is given.
+.IP \(bu 2
+.B ci start
+re-runs an existing run on the fetched
+.B origin/<branch>
+tip.
+It does not create the first run of a new workflow.
+.IP \(bu 2
+.B ci restart
+re-runs the cancelled ids; it does not retarget the current tip.
 .IP \(bu 2
 .B DRY_RUN=1
 is recommended before a bulk

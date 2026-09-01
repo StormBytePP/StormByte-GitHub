@@ -7,21 +7,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+[Unreleased]: https://github.com/StormBytePP/StormByte-GitHub/compare/1.1.1...HEAD
+
+## [1.1.1] - 2026-09-01
+
+Docs and contracts catch-up after the 1.1.0 script: `details` / `--module` /
+`--tag` / `--latest` were already in the binary and never made it out of
+`[Unreleased]`. CI stop / start / restart / status are now the same contract
+in code, help, man and README.
+
+Requires **StormByte-functions-bash ≥ 1.3.0**, **StormByte-functions-git ≥ 1.3.1**
+and **StormByte-functions-gh ≥ 1.0.0**.
+
 ### Added
 
-- `submodules details` [dir-spec] [--all] [--module spec]: first-level
+- `submodules details` `[dir-spec] [--all] [--module spec]`: first-level
   NAME / URL / PIN / LATEST. LATEST is the newest recognised release.
   `(semver)` only when the ref text is not already that semver. `--all`
   lists tags on master/main and origin branches; current pin marked with `*`.
 - `submodules update --latest`: plan the newest recognised release in the
   module (may cross major). Default stays in-family (B1 / B2).
 - `submodules update|details --module <name|path|!spec>`: filter first-level
-  gitlinks. dir-spec still selects parent clones. Unselected update rows stay
-  *No changes*.
-- `submodules update --tag <tag>`: requires a positive `--module`. Pins that
-  exact tag and ignores family / `--latest`.
+  gitlinks. dir-spec still selects parent clones.
+- `submodules update --tag <tag>` / `--branch <branch>`: require a positive
+  `--module`. Pin that exact ref and ignore family / `--latest`.
+- `ci status` prints two sets: active runs on the current branch (stop /
+  restart) and runs on the tip SHA (start).
+- EXIT / INT / TERM trap on `submodules update` and `submodules details`:
+  drop shadow refs; on update, restore the parent stash if one was created.
 
-[Unreleased]: https://github.com/StormBytePP/StormByte-GitHub/compare/1.1.0...HEAD
+### Changed
+
+- `STORMBYTE_GITHUB_VERSION` `1.1.0` → `1.1.1`.
+- `ci stop`: cancel every active run on the current branch, any SHA.
+- `ci start`: `git fetch origin --prune`, then re-run each workflow for
+  `origin/<branch>` (HEAD if that remote-tracking ref is missing). Dedup by
+  workflow name. Ignore rows whose `headSha` is not that tip. Does not
+  dispatch a workflow that never ran on that SHA. `--failed` only applies
+  here.
+- `ci restart`: cancel active runs and re-run **those same run ids** (the
+  SHA that was in flight). Retries `gh run rerun` after cancel. Not
+  stop + start.
+- `submodules update --module`: the plan lists **only** wanted modules.
+  Zero matches is a warning, not a table of *No changes* for the rest.
+- Nested `submodule update --init --recursive` after an update runs only
+  when at least one first-level pin was applied.
+- Local commit message stays `chore: update dependencies`; with `--module`
+  the name is appended in parentheses.
+- Help, man page and README match the binary (CI tip vs branch, restart
+  ids, `--module` plan, Ctrl-C cleanup, `gh.sh` requirement).
+
+### Fixed
+
+- `ci start` no longer re-runs a workflow from an older SHA when
+  `gh_run_list_for_start` falls back to the whole branch.
+- Stale `origin/<branch>` no longer defines the “tip” used by start /
+  status (fetch first).
+- Ctrl-C during `submodules update` no longer leaves shadow refs or an
+  unrestored parent stash.
+- Ctrl-C during `submodules details` no longer leaves shadow refs.
+
+### Notes
+
+- Detached HEAD is still an error for all `ci` subcommands.
+- `ci start` cannot create the first run of a new workflow.
+- Nested modules are still only synced to SHAs recorded by the parent.
+  `git pull` / `git sync` still do **not** re-pin first-level modules.
+
+[1.1.1]: https://github.com/StormBytePP/StormByte-GitHub/releases/tag/1.1.1
 
 ## [1.1.0] - 2026-08-28
 
