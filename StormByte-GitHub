@@ -1098,6 +1098,7 @@ cmd_submodules_update_one() {
 		for r in "${shadow_repos[@]}"; do
 			git_shadow_delete "$r"
 		done
+		shadow_repos=()
 	}
 
 	_sm_cheap_current() {
@@ -1118,6 +1119,25 @@ cmd_submodules_update_one() {
 			printf '%s' ""
 		fi
 	}
+
+	_sm_cleanup_on_exit() {
+		local rc=$?
+		trap - EXIT INT TERM
+		_sm_hint_clear
+		_sm_shadow_cleanup
+		if [[ "$stashed" -eq 1 ]]; then
+			log "  Restoring parent stash..."
+			if git_stash_pop_safe "$dir"; then
+				ok "Parent stash restored"
+			else
+				warn "stash pop had conflicts. Parent changes remain in the stash (git stash list)."
+				warn "Resolve them, then: git stash drop"
+			fi
+			stashed=0
+		fi
+		return "$rc"
+	}
+	trap '_sm_cleanup_on_exit' EXIT INT TERM
 
 	info "Path" "$dir"
 	info "Remote" "$repo"
@@ -1163,14 +1183,6 @@ cmd_submodules_update_one() {
 		plan_line=""
 
 		if ! _sm_module_wanted "$sm_name" "$sm_path"; then
-			current="$(_sm_cheap_current "$abs")"
-			plan_name+=("$sm_name")
-			plan_path+=("$sm_path")
-			plan_cur+=("$current")
-			plan_new+=("No changes")
-			plan_action+=("keep")
-			plan_kind+=("sha")
-			plan_target+=("")
 			continue
 		fi
 
@@ -1209,10 +1221,6 @@ cmd_submodules_update_one() {
 		if [[ "$action" == "error" ]]; then
 			_sm_hint_clear
 			err "${planned:-plan failed} for ${sm_name}"
-			_sm_shadow_cleanup
-			if [[ "$stashed" -eq 1 ]]; then
-				git_stash_pop_safe "$dir" >/dev/null 2>&1 || true
-			fi
 			return 1
 		fi
 
@@ -1363,10 +1371,6 @@ cmd_submodules_update_one() {
 	if [[ "$DRY_RUN" == "1" ]]; then
 		log "  [dry-run] no checkout"
 		LAST_COUNT=0
-		_sm_shadow_cleanup
-		if [[ "$stashed" -eq 1 ]]; then
-			git_stash_pop_safe "$dir" >/dev/null 2>&1 || true
-		fi
 		return 0
 	fi
 
@@ -1374,10 +1378,6 @@ cmd_submodules_update_one() {
 		if (( n_upd + n_re > 0 )); then
 			if ! confirm_yes "Apply this plan?"; then
 				warn "Aborted"
-				_sm_shadow_cleanup
-				if [[ "$stashed" -eq 1 ]]; then
-					git_stash_pop_safe "$dir" >/dev/null 2>&1 || true
-				fi
 				return 0
 			fi
 		fi
@@ -1425,18 +1425,6 @@ cmd_submodules_update_one() {
 		LAST_COUNT=1
 	else
 		LAST_COUNT=0
-	fi
-
-	_sm_shadow_cleanup
-
-	if [[ "$stashed" -eq 1 ]]; then
-		log "  Restoring parent stash..."
-		if git_stash_pop_safe "$dir"; then
-			ok "Parent stash restored"
-		else
-			warn "stash pop had conflicts. Parent changes remain in the stash (git stash list)."
-			warn "Resolve them, then: git stash drop"
-		fi
 	fi
 }
 
