@@ -5,6 +5,22 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Summary]
+
+StormByte-GitHub is the CLI for a tree of local clones under one `ROOT`:
+Actions caches, CI on the current branch, hard reset / rebase pull,
+pin-aware first-level submodules (A / B1 / B2, `--module`, `--tag`,
+`--latest`), inventory / dump / push, GitHub Releases from this
+changelog, forks under optional `FORK_ROOT`, search / `clone-all`, and
+asan/tsan drivers.
+
+It is not a wrapper around `gh` for a single repo. Dir-spec selects
+**parent clones**; `--module` selects gitlinks inside them. Nested
+modules follow recorded SHAs. Releases take notes from
+`## [<version>] - YYYY-MM-DD`; this Summary, when present, is prepended.
+
+Commands, pin policy, and install: [README.md](README.md).
+
 ## [Unreleased]
 
 [Unreleased]: https://github.com/StormBytePP/StormByte-GitHub/compare/1.1.1...HEAD

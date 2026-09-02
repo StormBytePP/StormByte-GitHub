@@ -373,7 +373,16 @@ ${_CLR_BOLD_CYAN}repos release${_CLR_RESET}  [dir-spec] [version] [--list | --de
 	Tag, push and create a GitHub Release.
 	Requires clean tree on master/main, OWNER remote, and CHANGELOG.md with:
 		## [<version>] - YYYY-MM-DD
-	Notes come from that section. Waits for CI unless --skip-ci
+	Notes are that section's body. If CHANGELOG.md also has
+		## [Summary]
+	(exactly that heading; the next ## heading ends the block), its body
+	is prepended:
+		## [Summary]
+		<summary body>
+		<version body>
+	No Summary → notes are only the version body (same as before).
+	A missing or empty version section is still FATAL.
+	Waits for CI unless --skip-ci
 	(Ctrl-C during wait: no tag yet). Same version recreates tag/release.
 	Pre-releases (e.g. 1.0.0-rc.1) use gh --prerelease.
 	Interactive confirmation (type yes). DRY_RUN supported for create/delete.
@@ -2392,6 +2401,86 @@ cmd_repos_release_list_one() {
 	LAST_COUNT=$count
 }
 
+# -----------------------------------------------------------------------------
+# changelog_extract_summary
+# -----------------------------------------------------------------------------
+# @brief Body of the Keep-a-Changelog heading \`## [Summary]\`.
+# @param[in] 1  Path to CHANGELOG.md.
+# @stdout       Section body (no heading). Leading/trailing blank lines stripped.
+# @return       0 if the section exists and is non-empty; 1 otherwise.
+# @note         Stop rule matches changelog_extract_notes: the next \`## \`
+#               heading ends the block. Optional — missing Summary is not
+#               an error for repos release.
+# @note         To be moved to functions.sh.
+changelog_extract_summary() {
+	local changelog="${1-}"
+	local body tmp rc
+
+	[[ -f "$changelog" ]] || return 1
+
+	tmp="$(mktemp)"
+	awk '
+		BEGIN { want = 0; found = 0 }
+		/^##[ \t]+\[Summary\][ \t]*$/ {
+			if (want == 1) exit
+			want = 1
+			found = 1
+			next
+		}
+		/^##[ \t]+/ {
+			if (want == 1) exit
+			next
+		}
+		want == 1 { print }
+		END { exit(found ? 0 : 1) }
+	' "$changelog" > "$tmp"
+	rc=$?
+	if [[ "$rc" -ne 0 ]]; then
+		rm -f "$tmp"
+		return 1
+	fi
+	body="$(sed -e '/./,$!d' "$tmp" | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}')"
+	rm -f "$tmp"
+	[[ -n "${body//[:space:]/}" ]] || return 1
+	printf '%s\n' "$body"
+}
+
+# -----------------------------------------------------------------------------
+# release_write_notes_file
+# -----------------------------------------------------------------------------
+# @brief CHANGELOG section for <version>, optional ## [Summary] prepended.
+# @param[in] 1  Path to CHANGELOG.md.
+# @param[in] 2  Version (v optional).
+# @param[in] 3  Destination notes file (overwritten).
+# @return       0 on success. 1 if the version section is missing or empty.
+# @note         No Summary → file is only the version body (old contract).
+#               Summary present →
+#                 ## [Summary]
+#                 <summary body>
+#                 <blank>
+#                 <version body>
+release_write_notes_file() {
+	local changelog="${1-}" version="${2-}" dest="${3-}"
+	local ver_body sum_body
+
+	[[ -n "$changelog" && -n "$version" && -n "$dest" ]] || return 1
+
+	if ! ver_body="$(git_changelog_extract_notes "$changelog" "$version")"; then
+		return 1
+	fi
+
+	if sum_body="$(changelog_extract_summary "$changelog")"; then
+		{
+			printf '%s\n\n' "## [Summary]"
+			printf '%s\n\n' "$sum_body"
+			printf '%s\n' "$ver_body"
+		} > "$dest"
+	else
+		printf '%s\n' "$ver_body" > "$dest"
+	fi
+	return 0
+}
+
 cmd_repos_release() {
 	local spec="" version="" do_list=0 do_delete=0 skip_ci=0
 	local dir repo ver_plain tag confirm has_release has_tag recreate=0
@@ -2417,9 +2506,6 @@ cmd_repos_release() {
 	done
 
 	if [[ "$do_list" -eq 1 ]]; then
-		if [[ -n "$spec" && "$spec" != '!'* && ! "$(version_is_valid "$spec" && echo 1)" ]]; then
-			:
-		fi
 		if [[ -n "$spec" && -z "$version" ]] && version_is_valid "$spec"; then
 			version="$spec"
 			spec=""
@@ -2498,7 +2584,7 @@ cmd_repos_release() {
 	[[ "$branch" == "master" || "$branch" == "main" ]] || displayError "Must be on master/main (now: $branch)"
 	git_is_dirty "$dir" && displayError "Working tree is dirty — commit or stash first"
 	notes_file="$(mktemp)"
-	if ! git_changelog_extract_notes "$dir/CHANGELOG.md" "$ver_plain" > "$notes_file"; then
+	if ! release_write_notes_file "$dir/CHANGELOG.md" "$ver_plain" "$notes_file"; then
 		rm -f "$notes_file"
 		displayError "CHANGELOG.md has no section for $ver_plain"
 	fi
