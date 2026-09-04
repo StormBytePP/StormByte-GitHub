@@ -1249,10 +1249,9 @@ cmd_submodules_update_one() {
 	local -a plan_name=() plan_path=() plan_cur=() plan_new=()
 	local -a plan_action=() plan_kind=() plan_target=()
 	local i reply sha_new got latest latest_sha prefix tag_sha br_sha pin_label
-	local plan_line pin_id latest_id commit_detail
+	local plan_line pin_id latest_id commit_detail want peeled
 	local heads="${GIT_SHADOW_HEADS:-refs/sb-gh/heads}"
 
-	# EXIT/INT/TERM run after this function's locals are gone (set -u).
 	_sm_update_dir="$1"
 	_sm_update_stashed=0
 	_sm_update_shadow_repos=()
@@ -1448,6 +1447,10 @@ cmd_submodules_update_one() {
 				n_upd=$((n_upd + 1))
 			elif [[ "$action" == "rerelease" ]]; then
 				n_re=$((n_re + 1))
+				kind="tag"
+				if [[ -z "$target" ]]; then
+					target="$(_sm_trim "${current%% (*)}")"
+				fi
 			elif [[ "$action" == "skip" ]]; then
 				n_unres=$((n_unres + 1))
 			fi
@@ -1511,6 +1514,10 @@ cmd_submodules_update_one() {
 				n_upd=$((n_upd + 1))
 			elif [[ "$action" == "rerelease" ]]; then
 				n_re=$((n_re + 1))
+				kind="tag"
+				if [[ -z "$target" ]]; then
+					target="$(_sm_trim "${current%% (*)}")"
+				fi
 			fi
 		fi
 
@@ -1563,8 +1570,38 @@ cmd_submodules_update_one() {
 		kind="${plan_kind[$i]}"
 		target="${plan_target[$i]}"
 		abs="$_sm_update_dir/${plan_path[$i]}"
-		[[ "$action" == "keep" || "$action" == "skip" || -z "$target" ]] && continue
-		if [[ "$kind" == "branch" ]]; then
+		want=""
+		if [[ "$action" == "keep" || "$action" == "skip" ]]; then
+			continue
+		fi
+		if [[ "$action" == "rerelease" ]]; then
+			kind="tag"
+			if [[ -z "$target" ]]; then
+				target="$(_sm_trim "${plan_cur[$i]%% (*)}")"
+			fi
+			# git_sm_plan's sha column is the CURRENT pin. Destination is
+			# the short SHA inside PLANNED: "re-release (3cc3c52)".
+			if [[ "${plan_new[$i]}" =~ \(([0-9a-fA-F]{7,})\) ]]; then
+				want="${BASH_REMATCH[1]}"
+			fi
+			if [[ -z "$want" ]]; then
+				warn "re-release for ${plan_name[$i]} has no destination SHA in '${plan_new[$i]}'"
+				continue
+			fi
+			git -C "$abs" fetch --tags --force origin >/dev/null 2>&1 || true
+			peeled="$(git -C "$abs" rev-parse --verify "${want}^{commit}" 2>/dev/null || true)"
+			if [[ -z "$peeled" ]]; then
+				warn "object ${want} not in ${plan_name[$i]} after fetch"
+				continue
+			fi
+			if ! git -C "$abs" checkout --detach "$peeled" >/dev/null 2>&1; then
+				warn "checkout ${peeled} failed for ${plan_name[$i]}"
+				continue
+			fi
+		elif [[ -z "$target" ]]; then
+			warn "no checkout target for ${plan_name[$i]} (${action})"
+			continue
+		elif [[ "$kind" == "branch" ]]; then
 			if ! git_sm_checkout_branch "$abs" "$target"; then
 				warn "checkout origin/${target} failed for ${plan_name[$i]}"
 				continue
@@ -1576,6 +1613,10 @@ cmd_submodules_update_one() {
 			fi
 		fi
 		sha_new="$(git -C "$abs" rev-parse HEAD)"
+		if [[ -n "$want" && "${sha_new}" != "${want}"* && "${sha_new}" != "${peeled}" ]]; then
+			err "${plan_name[$i]} HEAD is ${sha_new:0:7}, wanted ${want} — refusing to stage a noop"
+			continue
+		fi
 		if ! git -C "$_sm_update_dir" update-index --cacheinfo "160000,${sha_new},${plan_path[$i]}"; then
 			warn "update-index ${plan_path[$i]} failed for ${plan_name[$i]}"
 			continue
