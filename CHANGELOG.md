@@ -22,6 +22,13 @@ modules follow recorded SHAs. Releases take notes from
 Commands, pin policy, and install: [README.md](README.md).
 
 ## [Unreleased]
+
+### Fixed
+
+- `repos release` treats only push and pull-request runs as CI. A failed
+  `workflow_dispatch` on the same commit (the Release workflow) no longer
+  aborts the release while GitHub shows the CI checks green.
+
 [Unreleased]: https://github.com/StormBytePP/StormByte-GitHub/compare/1.1.2...HEAD
 
 ## [1.1.2] - 2026-10-16

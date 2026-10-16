@@ -631,10 +631,15 @@ an origin whose owner is one of the configured owners, and a non-empty
 section
 .BI "## [" version "] - YYYY-MM-DD" .
 Release notes come from that section.
-The command waits for CI on HEAD unless
+The command waits for push or pull-request CI on HEAD unless
 .B --skip-ci
-is given
-(Ctrl-C during that wait leaves no tag).
+is given.
+A
+.B workflow_dispatch
+on that commit, including a failed
+.B Release
+run, is not that CI.
+Ctrl-C during that wait leaves no tag.
 The same version deletes and recreates tag and Release.
 Pre-releases such as
 .B 1.0.0-rc.1

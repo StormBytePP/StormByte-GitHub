@@ -452,7 +452,8 @@ ${_CLR_BOLD_CYAN}repos release${_CLR_RESET}  [dir-spec] [version] [--list | --de
 		<version body>
 	No Summary → notes are only the version body (same as before).
 	A missing or empty version section is still FATAL.
-	Waits for CI unless --skip-ci
+	Waits for push/PR CI unless --skip-ci
+	(a workflow_dispatch on that commit, including Release, is not CI).
 	(Ctrl-C during that wait: no tag yet). Same version recreates tag/release.
 	Pre-releases (e.g. 1.0.0-rc.1) use gh --prerelease.
 	After the GitHub Release exists, dispatch workflow release.yml on that
@@ -2597,6 +2598,98 @@ release_write_notes_file() {
 	return 0
 }
 
+# Push/PR CI only. A workflow_dispatch on the same SHA (the Release
+# workflow, a manual re-run) is not the commit check and must not block.
+_wait_ci_green() {
+	local repo="$1" sha="$2" timeout="${3:-3600}"
+	local start now elapsed pending failed live=0 status_open=0 saw
+	local -a runs=()
+	local line st conc event name
+
+	[[ -t 2 ]] && live=1
+
+	_ci_status_close() {
+		if [[ "$status_open" -eq 1 ]]; then
+			printf '\n' >&2
+			status_open=0
+		fi
+	}
+
+	_ci_waiting_line() {
+		local e="$1"
+		if [[ "$live" -eq 1 ]]; then
+			printf '\r  waiting for CI on %s… %ss   ' "${sha:0:12}" "$e" >&2
+			status_open=1
+		fi
+	}
+
+	trap '_ci_status_close; return 130' INT
+	start="$(date +%s)"
+
+	while true; do
+		now="$(date +%s)"
+		elapsed=$((now - start))
+		if ((elapsed > timeout)); then
+			_ci_status_close
+			trap - INT
+			printf '  CI wait timed out after %ss\n' "$timeout" >&2
+			return 1
+		fi
+
+		runs=()
+		while IFS= read -r line; do
+			[[ -n "$line" ]] && runs+=("$line")
+		done < <(
+			gh run list -R "$repo" --commit "$sha" --limit 50 \
+				--json status,conclusion,name,event,workflowName \
+				--jq '.[] | "\(.status)\t\(.conclusion // "-")\t\(.event // "-")\t\(.workflowName // .name // "?")"' \
+				2>/dev/null || true
+		)
+
+		pending=0
+		failed=0
+		saw=0
+		name=""
+		for line in "${runs[@]}"; do
+			[[ -z "$line" ]] && continue
+			st="${line%%$'\t'*}"
+			conc="${line#*$'\t'}"
+			event="${conc#*$'\t'}"
+			name="${event#*$'\t'}"
+			event="${event%%$'\t'*}"
+			conc="${conc%%$'\t'*}"
+			case "${event,,}" in
+				push|pull_request|pull_request_target) ;;
+				*) continue ;;
+			esac
+			saw=1
+			case "${st,,}" in
+				completed)
+					case "${conc,,}" in
+						success|skipped|neutral) ;;
+						*) failed=1; break ;;
+					esac
+					;;
+				*) pending=1 ;;
+			esac
+		done
+
+		if [[ "$failed" -eq 1 ]]; then
+			_ci_status_close
+			trap - INT
+			printf '  CI failed for %s (%s)\n' "${sha:0:12}" "$name" >&2
+			return 1
+		fi
+		if [[ "$saw" -eq 1 && "$pending" -eq 0 ]]; then
+			_ci_status_close
+			trap - INT
+			return 0
+		fi
+		_ci_waiting_line "$elapsed"
+		sleep 15
+	done
+}
+
 # Prints "<kind>\t<selector>". kind is active, missing, disabled, or unknown.
 # selector is what "gh workflow run" accepts (filename or workflow name).
 _repos_release_workflow_kind() {
@@ -2914,7 +3007,7 @@ cmd_repos_release() {
 
 	if [[ "$skip_ci" -eq 0 ]]; then
 		info "CI" "waiting for green on $sha"
-		if ! gh_wait_ci_success "$repo" "$sha"; then
+		if ! _wait_ci_green "$repo" "$sha"; then
 			rm -f "$notes_file"
 			displayError "CI not green — release aborted (nothing tagged)"
 		fi
