@@ -74,21 +74,18 @@ prompt_config() {
 	echo
 
 	printf '  %s┌─ OWNER ──────────────────────────────────────────────┐%s\n' "${_CLR_BOLD_CYAN}" "${_CLR_RESET}"
-	printf '  %s│%s GitHub username that owns the repositories.          %s│%s\n' "${_CLR_BOLD_CYAN}" "${_CLR_RESET}" "${_CLR_BOLD_CYAN}" "${_CLR_RESET}"
-	printf '  %s│%s Used to verify origin remotes and for clone-all.     %s│%s\n' "${_CLR_BOLD_CYAN}" "${_CLR_RESET}" "${_CLR_BOLD_CYAN}" "${_CLR_RESET}"
+	printf '  %s│%s One or more GitHub users or organisations.           %s│%s\n' "${_CLR_BOLD_CYAN}" "${_CLR_RESET}" "${_CLR_BOLD_CYAN}" "${_CLR_RESET}"
+	printf '  %s│%s Separate them with a space or a comma.               %s│%s\n' "${_CLR_BOLD_CYAN}" "${_CLR_RESET}" "${_CLR_BOLD_CYAN}" "${_CLR_RESET}"
+	printf '  %s│%s A clone is accepted when origin is any of them.      %s│%s\n' "${_CLR_BOLD_CYAN}" "${_CLR_RESET}" "${_CLR_BOLD_CYAN}" "${_CLR_RESET}"
 	printf '  %s└──────────────────────────────────────────────────────┘%s\n' "${_CLR_BOLD_CYAN}" "${_CLR_RESET}"
 	while true; do
 		read -r -p "  OWNER [SomeGitHubUser]: " input
 		input="${input:-}"
-		if [[ -z "$input" ]]; then
-			echo "  → Please enter a GitHub username (e.g. SomeGitHubUser)."
-			continue
-		fi
-		if [[ "$input" =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]]; then
+		if owners_input_ok "$input"; then
 			OWNER="$input"
 			break
 		fi
-		echo "  → Invalid GitHub username."
+		echo "  → Enter one or more GitHub usernames, separated by space or comma."
 	done
 	echo
 
@@ -188,6 +185,79 @@ load_or_create_config() {
 		require_dir "$FORK_ROOT"
 		FORK_ROOT="$(dir_realpath "$FORK_ROOT")"
 	fi
+
+	owners_parse "$OWNER"
+}
+
+# OWNERS is the accepted origin owners. OWNER is the same list for display.
+declare -a OWNERS=()
+
+owners_label() {
+	local out="" o
+	for o in "${OWNERS[@]}"; do
+		if [[ -z "$out" ]]; then
+			out="$o"
+		else
+			out+=", $o"
+		fi
+	done
+	printf '%s' "$out"
+}
+
+owners_input_ok() {
+	local raw="${1:-}" token
+	local -a parts=()
+	raw="${raw//,/ }"
+	read -r -a parts <<< "$raw"
+	((${#parts[@]} > 0)) || return 1
+	for token in "${parts[@]}"; do
+		[[ "$token" =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]] || return 1
+	done
+	return 0
+}
+
+owners_parse() {
+	local raw="${1:-}" token key
+	local -a parts=()
+	local -A seen=()
+	OWNERS=()
+	raw="${raw//,/ }"
+	read -r -a parts <<< "$raw"
+	for token in "${parts[@]}"; do
+		[[ -z "$token" ]] && continue
+		[[ "$token" =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]] \
+			|| displayError "Invalid OWNER entry: $token"
+		key="${token,,}"
+		[[ -n "${seen[$key]+x}" ]] && continue
+		seen["$key"]=1
+		OWNERS+=("$token")
+	done
+	((${#OWNERS[@]} > 0)) || displayError "OWNER is not set in $CONFIG_FILE (or OWNER env)"
+	OWNER="$(owners_label)"
+}
+
+# stdout: owner/repo when origin belongs to one of OWNERS.
+resolve_allowed_repo() {
+	local dir="$1" owner slug
+	for owner in "${OWNERS[@]}"; do
+		if slug="$(git_resolve_repo "$dir" "$owner" 2>/dev/null)"; then
+			printf '%s\n' "$slug"
+			return 0
+		fi
+	done
+	return 1
+}
+
+reject_unowned_repo() {
+	local dir="$1" actual
+	actual="$(git_remote_owner "$dir" 2>/dev/null || true)"
+	if [[ -n "$actual" ]]; then
+		printf "Origin owner is '%s', expected one of: %s: %s\n" \
+			"$actual" "$(owners_label)" "$dir" >&2
+	else
+		git_resolve_repo "$dir" "${OWNERS[0]}" >&2 || true
+	fi
+	displayError "Target must belong to one of: $(owners_label): $dir"
 }
 
 fork_effective_root() {
@@ -236,7 +306,7 @@ ${SCRIPT_NAME} <command> [subcommand] [arguments…]
 
 ${_CLR_BOLD}CONFIGURATION${_CLR_RESET}
 File: ${CONFIG_FILE}
-OWNER       GitHub username
+OWNER       GitHub users or orgs that may own a clone (space or comma)
 ROOT        Working root directory (most commands)
 OUT         Output directory (repos dump)
 FORK_ROOT   Optional root used only by \"fork\" commands
@@ -246,7 +316,7 @@ ${_CLR_BOLD}GLOBAL ENVIRONMENT${_CLR_RESET}
 DRY_RUN=1              Simulate actions without applying them
 ROOT=/path             Override ROOT from config for this run
 OUT=/path              Override OUT from config for this run
-OWNER=name             Override OWNER from config for this run
+OWNER=a,b              Override the owner list for this run
 FORK_ROOT=/path        Override FORK_ROOT from config for this run
 PAGE_LIMIT=N           Items per API page (default: 100)
 MAX_PAGES=N            Max cache delete passes; 0 = until empty
@@ -371,7 +441,7 @@ ${_CLR_BOLD_CYAN}repos release${_CLR_RESET}  [dir-spec] [version] [--list | --de
 
 	${_CLR_BOLD}CREATE${_CLR_RESET} (default)  <dir> <version> [--skip-ci]
 	Tag, push and create a GitHub Release.
-	Requires clean tree on master/main, OWNER remote, and CHANGELOG.md with:
+	Requires clean tree on master/main, an origin owned by one of the configured owners, and CHANGELOG.md with:
 		## [<version>] - YYYY-MM-DD
 	Notes are that section's body. If CHANGELOG.md also has
 		## [Summary]
@@ -393,7 +463,7 @@ ${_CLR_BOLD_CYAN}repos release${_CLR_RESET}  [dir-spec] [version] [--list | --de
 	Interactive confirmation (type yes). DRY_RUN supported for create/delete.
 
 ${_CLR_BOLD_CYAN}clone-all${_CLR_RESET}
-	Clone all public repositories of \$OWNER that are missing under \$ROOT.
+	Clone all public repositories of the configured owners that are missing under \$ROOT.
 
 ${_CLR_BOLD_CYAN}search <text>${_CLR_RESET}  [dir-spec]
 	Search text in the code of the selected repositories.
@@ -447,7 +517,7 @@ ${SCRIPT_NAME} search \"mimalloc\"
 ${SCRIPT_NAME} test asan multimedia
 
 ${_CLR_BOLD}NOTES${_CLR_RESET}
-• Repositories must belong to the configured OWNER (or OWNER env override).
+• Repositories must belong to one of the configured owners (or the OWNER env override).
 • Omitting the dir-spec walks every immediate subdirectory of the effective root.
 • Running with no arguments shows this help.
 EOF
@@ -540,7 +610,7 @@ foreach_repo() {
 	if [[ ${#INCLUDE_ITEMS[@]} -eq 1 && ${#EXCLUDE_ITEMS[@]} -eq 0 ]]; then
 		dir="$(resolve_repo_dir "${INCLUDE_ITEMS[0]}" "$walk_root")"
 		section "$(basename "$dir")"
-		repo="$(git_resolve_repo "$dir" "$OWNER")" || displayError "Target must be a ${OWNER} git repository: $dir"
+		repo="$(resolve_allowed_repo "$dir")" || reject_unowned_repo "$dir"
 		LAST_COUNT=0
 		LAST_BYTES=0
 		"$callback" "$dir" "$repo"
@@ -560,8 +630,8 @@ foreach_repo() {
 			warn "Not a git repo — skip"
 			continue
 		fi
-		if ! repo="$(git_resolve_repo "$dir" "$OWNER" 2>/dev/null)"; then
-			warn "Skip (not a usable ${OWNER} repo)"
+		if ! repo="$(resolve_allowed_repo "$dir")"; then
+			warn "Skip (not owned by $(owners_label))"
 			continue
 		fi
 		LAST_COUNT=0
@@ -1125,7 +1195,7 @@ build_update_order() {
 	for dir in "$ROOT"/*/; do
 		dir="${dir%/}"
 		[[ -d "$dir/.git" || -f "$dir/.git" ]] || continue
-		repo_disp="$(git_resolve_repo "$dir" "$OWNER" 2>/dev/null)" || continue
+		repo_disp="$(resolve_allowed_repo "$dir")" || continue
 		id="$(git_canonical_repo_id "https://github.com/${repo_disp}.git")" || continue
 		name="$(basename "$dir")"
 		if [[ -n "${id_to_folder[$id]+x}" ]]; then
@@ -1691,7 +1761,7 @@ cmd_submodules_add() {
 	dir="$(resolve_dir_under "$ROOT" "${pos[0]}")"
 	url="${pos[1]}"
 	path="${pos[2]}"
-	repo="$(git_resolve_repo "$dir" "$OWNER")" || displayError "Target must be a ${OWNER} git repository: $dir"
+	repo="$(resolve_allowed_repo "$dir")" || reject_unowned_repo "$dir"
 	git_submodule_path_is_safe "$path" || displayError "Invalid path '$path' (must be relative to the repo and must not contain '..')"
 	section "$(basename "$dir")"
 	info "Path" "$dir"
@@ -1728,7 +1798,7 @@ cmd_submodules_delete() {
 	[[ ${#pos[@]} -eq 1 ]] || usage_error "Expected exactly one <dir> (got ${#pos[@]})" \
 		"submodules delete <dir> (--name <name> | --url <url> | --path <path>)"
 	dir="$(resolve_dir_under "$ROOT" "${pos[0]}")"
-	repo="$(git_resolve_repo "$dir" "$OWNER")" || displayError "Target must be a ${OWNER} git repository: $dir"
+	repo="$(resolve_allowed_repo "$dir")" || reject_unowned_repo "$dir"
 	[[ -n "$name_sel" ]] && selectors=$((selectors + 1))
 	[[ -n "$url_sel"  ]] && selectors=$((selectors + 1))
 	[[ -n "$path_sel" ]] && selectors=$((selectors + 1))
@@ -2078,8 +2148,8 @@ cmd_submodules() {
 				for name in "${ordered[@]}"; do
 					dir="$ROOT/$name"
 					section "$name"
-					if ! repo="$(git_resolve_repo "$dir" "$OWNER" 2>/dev/null)"; then
-						warn "Skip (not a usable ${OWNER} repo)"
+					if ! repo="$(resolve_allowed_repo "$dir")"; then
+						warn "Skip (not owned by $(owners_label))"
 						continue
 					fi
 					LAST_COUNT=0
@@ -2175,7 +2245,7 @@ cmd_repos_list() {
 			count=$((count + 1))
 			continue
 		fi
-		if ! repo="$(git_resolve_repo "$dir" "$OWNER" 2>/dev/null)"; then
+		if ! repo="$(resolve_allowed_repo "$dir")"; then
 			repo="$(git_remote_repo "$dir" 2>/dev/null || echo "?")"
 		fi
 		branch="$(git_current_branch "$dir")"
@@ -2721,7 +2791,7 @@ cmd_repos_release() {
 			dir="$(resolve_repo_dir "$spec" "$ROOT")"
 			[[ -d "$dir" ]] || displayError "Directory does not exist: $dir"
 			section "$(basename "$dir")"
-			repo="$(git_resolve_repo "$dir" "$OWNER")" || displayError "Target must be a ${OWNER} git repository: $dir"
+			repo="$(resolve_allowed_repo "$dir")" || reject_unowned_repo "$dir"
 			LAST_COUNT=0
 			cmd_repos_release_list_one "$dir" "$repo" "$filter_ver"
 			print_summary "releases listed" "$LAST_COUNT"
@@ -2740,7 +2810,7 @@ cmd_repos_release() {
 	tag="$version"
 	dir="$(resolve_repo_dir "$spec" "$ROOT")"
 	[[ -d "$dir" ]] || displayError "Directory does not exist: $dir"
-	repo="$(git_resolve_repo "$dir" "$OWNER")" || displayError "Target must be a ${OWNER} git repository: $dir"
+	repo="$(resolve_allowed_repo "$dir")" || reject_unowned_repo "$dir"
 	section "$(basename "$dir")"
 	info "Path" "$dir"
 	info "Remote" "$repo"
@@ -2913,35 +2983,42 @@ cmd_repos() {
 # =============================================================================
 
 cmd_clone_all() {
-	local name dir cloned=0 skipped=0
+	local owner name dir cloned=0 skipped=0 found=0
 	local -a repos=()
-	info "Owner" "$OWNER"
+	info "Owners" "$(owners_label)"
 	info "Target" "$ROOT"
-	mapfile -t repos < <(gh_repo_list_public "$OWNER" 1000)
-	if [[ ${#repos[@]} -eq 0 ]]; then
-		warn "No public repositories found for $OWNER"
+	for owner in "${OWNERS[@]}"; do
+		info "Owner" "$owner"
+		mapfile -t repos < <(gh_repo_list_public "$owner" 1000)
+		if [[ ${#repos[@]} -eq 0 ]]; then
+			warn "No public repositories found for $owner"
+			continue
+		fi
+		found=1
+		for name in "${repos[@]}"; do
+			dir="$ROOT/$name"
+			if [[ -d "$dir" ]]; then
+				log "  skip (exists): $name"
+				skipped=$((skipped + 1))
+				continue
+			fi
+			if [[ "$DRY_RUN" == "1" ]]; then
+				log "  [dry-run] would clone $owner/$name"
+				cloned=$((cloned + 1))
+				continue
+			fi
+			log "  cloning $owner/$name ..."
+			if gh_repo_clone "$owner/$name" "$dir"; then
+				ok "Cloned $name"
+				cloned=$((cloned + 1))
+			else
+				warn "Failed to clone $name"
+			fi
+		done
+	done
+	if [[ "$found" -eq 0 ]]; then
 		return 0
 	fi
-	for name in "${repos[@]}"; do
-		dir="$ROOT/$name"
-		if [[ -d "$dir" ]]; then
-			log "  skip (exists): $name"
-			skipped=$((skipped + 1))
-			continue
-		fi
-		if [[ "$DRY_RUN" == "1" ]]; then
-			log "  [dry-run] would clone $OWNER/$name"
-			cloned=$((cloned + 1))
-			continue
-		fi
-		log "  cloning $OWNER/$name ..."
-		if gh_repo_clone "$OWNER/$name" "$dir"; then
-			ok "Cloned $name"
-			cloned=$((cloned + 1))
-		else
-			warn "Failed to clone $name"
-		fi
-	done
 	__walk_repos=$cloned
 	print_summary "cloned" "$cloned"
 	info "Skipped (already present)" "$skipped"

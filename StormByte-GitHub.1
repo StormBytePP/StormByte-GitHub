@@ -56,9 +56,14 @@ Configuration file. Supported variables:
 .RS
 .TP
 .B OWNER
-GitHub username that owns the repositories.
-Used to verify origin remotes and by
-.BR clone-all .
+One or more GitHub users or organisations that may own a clone.
+Separate names with a space or a comma
+.RB ( "StormByte-Suite StormBytePP" ).
+A repository is accepted when its origin owner is any of them
+(the check is case-insensitive).
+Also used by
+.BR clone-all ,
+once per name.
 .TP
 .B ROOT
 Working root that contains local clones.
@@ -96,10 +101,10 @@ Override
 .B OUT
 from the config file for this run.
 .TP
-.B OWNER=\fIname\fR
-Override
-.B OWNER
-from the config file for this run.
+.B OWNER=\fInames\fR
+Override the owner list for this run.
+Same spelling as in the config file: one name, or several separated by
+a space or a comma.
 .TP
 .B FORK_ROOT=\fI/path\fR
 Override
@@ -588,9 +593,8 @@ Honours
 .BR DRY_RUN .
 .TP
 .B repos release\fR [\fIdir-spec\fR] [\fIversion\fR] [\fB--list\fR | \fB--delete\fR | \fB--skip-ci\fR]
-Manage version tags and GitHub Releases for
-.B OWNER
-repositories.
+Manage version tags and GitHub Releases for repositories owned by one of
+the configured owners.
 .RS
 .TP
 .B --list
@@ -622,9 +626,7 @@ Requires a clean tree on
 .B master
 or
 .BR main ,
-an
-.B OWNER
-remote, and a non-empty
+an origin whose owner is one of the configured owners, and a non-empty
 .B CHANGELOG.md
 section
 .BI "## [" version "] - YYYY-MM-DD" .
@@ -661,8 +663,7 @@ is supported for create and delete.
 .B clone-all
 Clone every
 .B public
-repository of
-.B OWNER
+repository of each configured owner
 that is missing under
 .BR ROOT .
 Existing folders are left alone.
@@ -931,11 +932,10 @@ Same search path.
 Required version \(>= 1.0.0.
 .SH NOTES
 .IP \(bu 2
-Repositories must belong to the configured
-.B OWNER
+Repositories must belong to one of the configured owners
 (or the
 .B OWNER
-environment override).
+environment override, which replaces the whole list).
 .IP \(bu 2
 Omitting the dir-spec walks every immediate subdirectory of the effective
 root.

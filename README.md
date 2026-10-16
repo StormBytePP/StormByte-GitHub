@@ -28,7 +28,7 @@ source dumps, releases, forks, search/clone helpers, and sanitizer test drivers.
 | **Submodules** | `init` / `deinit` / `update` / `list` / `details` / `add` / `delete`. Update follows A / B1 / B2; `--latest` may cross major; `--module` / `--tag` filter or pin one gitlink; `details` reports PIN vs newest release |
 | **Repos** | inventory, source dump, status, push, release (create / list / delete) |
 | **Fork** | `status` / `sync` / `branch-status` under optional `FORK_ROOT` |
-| **Search / clone** | local code search and `clone-all` for the configured owner |
+| **Search / clone** | local code search and `clone-all` for every configured owner |
 | **Test** | `asan` / `tsan` via CMake + ctest or a binary |
 | **Dir-spec** | parent clones under the root, a single path, or exclusions (`!name`, `!a+!b`). Never a submodule name (`--module` does that) |
 
@@ -85,7 +85,7 @@ On first run the tool writes `~/.StormByte-GitHub.conf` (interactive prompts):
 
 | Key | Meaning |
 |-----|---------|
-| **OWNER** | GitHub username that owns the repositories |
+| **OWNER** | One or more GitHub users or organisations, separated by space or comma. A clone is accepted when its origin is any of them |
 | **ROOT** | Working root (immediate subdirs = local clones for most commands) |
 | **OUT** | Output directory for `repos dump` |
 | **FORK_ROOT** | Optional root used **only** by `fork` (if unset, `fork` uses `ROOT`) |
@@ -93,7 +93,7 @@ On first run the tool writes `~/.StormByte-GitHub.conf` (interactive prompts):
 Override for a single run:
 
 ```bash
-ROOT=~/Software OWNER=StormBytePP StormByte-GitHub repos list
+ROOT=~/Software OWNER='StormByte-Suite StormBytePP' StormByte-GitHub repos list
 DRY_RUN=1 StormByte-GitHub cache delete
 FORK_ROOT=~/Forks StormByte-GitHub fork status
 ```
@@ -375,7 +375,7 @@ StormByte-GitHub clone-all
 ```
 
 `search` is local to the selected clones (not GitHub code search).
-`clone-all` clones every **public** `$OWNER` repository missing under `$ROOT`.
+`clone-all` clones every **public** repository of each configured owner that is missing under `$ROOT`.
 Existing folders are left alone.
 
 ---
@@ -431,7 +431,7 @@ from `CHANGELOG.md`.
 
 ## Notes
 
-- Repositories must belong to the configured **OWNER** (or the `OWNER=` override).
+- Repositories must belong to one of the configured owners (or the `OWNER=` override, which replaces the whole list).
 - Omitting the dir-spec walks only **immediate** subdirectories of the effective
   root (not a recursive `find`).
 - `dir-spec` selects parent clones; `--module` selects first-level gitlinks.

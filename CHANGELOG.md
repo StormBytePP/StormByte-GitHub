@@ -27,8 +27,7 @@ Commands, pin policy, and install: [README.md](README.md).
 ## [1.1.2] - 2026-10-16
 
 `repos release` now starts the repository's `release` workflow after the
-GitHub Release exists, and bash completion no longer dies under the shell
-options that used to abort it.
+GitHub Release exists, and `OWNER` may list more than one GitHub account.
 
 Requires **StormByte-functions-bash ≥ 1.3.0**, **StormByte-functions-git ≥ 1.3.1**
 and **StormByte-functions-gh ≥ 1.0.0**.
@@ -45,8 +44,13 @@ and **StormByte-functions-gh ≥ 1.0.0**.
 ### Changed
 
 - `STORMBYTE_GITHUB_VERSION` `1.1.1` → `1.1.2`.
-- Help, man page and README describe the release-workflow wait, including
-  what Ctrl-C does before the tag exists and after the Release exists.
+- `OWNER` accepts one GitHub user or organisation, or several separated by
+  a space or a comma, both in the first-run prompt and in
+  `~/.StormByte-GitHub.conf`. A clone is accepted when its origin owner is
+  any of them. `OWNER=` for one run replaces the whole list. `clone-all`
+  walks every configured owner. An existing single name keeps working.
+- Help, man page and README describe the owner list and the release-workflow
+  wait.
 
 ### Fixed
 
