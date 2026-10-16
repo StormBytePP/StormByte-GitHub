@@ -22,49 +22,28 @@ modules follow recorded SHAs. Releases take notes from
 Commands, pin policy, and install: [README.md](README.md).
 
 ## [Unreleased]
-
-### Fixed
-
-- `repos release` treats only push and pull-request runs as CI. A failed
-  `workflow_dispatch` on the same commit (the Release workflow) no longer
-  aborts the release while GitHub shows the CI checks green.
-
 [Unreleased]: https://github.com/StormBytePP/StormByte-GitHub/compare/1.1.2...HEAD
 
 ## [1.1.2] - 2026-10-16
 
-`repos release` now starts the repository's `release` workflow after the
-GitHub Release exists, and `OWNER` may list more than one GitHub account.
+`repos release` now starts the repository's `release` workflow after the GitHub Release exists, and `OWNER` may list more than one GitHub account.
 
-Requires **StormByte-functions-bash ≥ 1.3.0**, **StormByte-functions-git ≥ 1.3.1**
-and **StormByte-functions-gh ≥ 1.0.0**.
+Requires **StormByte-functions-bash ≥ 1.3.0**, **StormByte-functions-git ≥ 1.3.1** and **StormByte-functions-gh ≥ 1.0.0**.
 
 ### Added
 
-- `repos release` dispatches workflow `release.yml` (or a workflow named
-  `Release`) on the new tag and waits for that run. If the run fails, is
-  cancelled, or the wait is interrupted with Ctrl-C, the tag and the GitHub
-  Release just created are deleted and the command aborts. A repository
-  with no such workflow, or with it disabled, prints a warning and leaves
-  the Release in place. `--skip-ci` still only skips the pre-tag CI wait.
+- `repos release` dispatches workflow `release.yml` (or a workflow named `Release`) on the new tag and waits for that run. If the run fails, is cancelled, or the wait is interrupted with Ctrl-C, the tag and the GitHub Release just created are deleted and the command aborts. A repository with no such workflow, or with it disabled, prints a warning and leaves the Release in place. `--skip-ci` still only skips the pre-tag CI wait.
 
 ### Changed
 
 - `STORMBYTE_GITHUB_VERSION` `1.1.1` → `1.1.2`.
-- `OWNER` accepts one GitHub user or organisation, or several separated by
-  a space or a comma, both in the first-run prompt and in
-  `~/.StormByte-GitHub.conf`. A clone is accepted when its origin owner is
-  any of them. `OWNER=` for one run replaces the whole list. `clone-all`
-  walks every configured owner. An existing single name keeps working.
-- Help, man page and README describe the owner list and the release-workflow
-  wait.
+- `OWNER` accepts one GitHub user or organisation, or several separated by a space or a comma, both in the first-run prompt and in `~/.StormByte-GitHub.conf`. A clone is accepted when its origin owner is any of them. `OWNER=` for one run replaces the whole list. `clone-all` walks every configured owner. An existing single name keeps working.
+- Help, man page and README describe the owner list and the release-workflow wait.
 
 ### Fixed
 
-- Bash completion no longer aborts when the interactive shell has `set -e`,
-  `set -u`, `pipefail` or `failglob`. `--name=*` is matched as a pattern
-  instead of a filename glob. Submodule names that contain spaces complete
-  as one word.
+- Bash completion no longer aborts when the interactive shell has `set -e`, `set -u`, `pipefail` or `failglob`. `--name=*` is matched as a pattern instead of a filename glob. Submodule names that contain spaces complete as one word.
+- `repos release` treats only push and pull-request runs as CI. A failed `workflow_dispatch` on the same commit (the Release workflow) no longer aborts the release while GitHub shows the CI checks green.
 
 [1.1.2]: https://github.com/StormBytePP/StormByte-GitHub/compare/1.1.1...1.1.2
 
