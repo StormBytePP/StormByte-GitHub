@@ -4,7 +4,7 @@
 # =============================================================================
 set -euo pipefail
 
-readonly STORMBYTE_GITHUB_VERSION="1.1.1"
+readonly STORMBYTE_GITHUB_VERSION="1.1.2"
 readonly REQUIRE_STORMBYTE_FUNCTIONS="1.3.0"
 readonly REQUIRE_STORMBYTE_FUNCTIONS_GIT="1.3.1"
 readonly REQUIRE_STORMBYTE_FUNCTIONS_GH="1.0.0"
@@ -383,8 +383,13 @@ ${_CLR_BOLD_CYAN}repos release${_CLR_RESET}  [dir-spec] [version] [--list | --de
 	No Summary → notes are only the version body (same as before).
 	A missing or empty version section is still FATAL.
 	Waits for CI unless --skip-ci
-	(Ctrl-C during wait: no tag yet). Same version recreates tag/release.
+	(Ctrl-C during that wait: no tag yet). Same version recreates tag/release.
 	Pre-releases (e.g. 1.0.0-rc.1) use gh --prerelease.
+	After the GitHub Release exists, dispatch workflow release.yml on that
+	tag and wait. If that run fails, or Ctrl-C while waiting, the tag and
+	Release just created are deleted and the command aborts.
+	No release.yml (or it is disabled): warning only; the Release stays.
+	--skip-ci does not skip that dispatch.
 	Interactive confirmation (type yes). DRY_RUN supported for create/delete.
 
 ${_CLR_BOLD_CYAN}clone-all${_CLR_RESET}
@@ -2522,6 +2527,165 @@ release_write_notes_file() {
 	return 0
 }
 
+# Prints "<kind>\t<selector>". kind is active, missing, disabled, or unknown.
+# selector is what "gh workflow run" accepts (filename or workflow name).
+_repos_release_workflow_kind() {
+	local repo="$1"
+	local json
+
+	if ! json="$(gh workflow list --repo "$repo" --json name,path,state 2>/dev/null)"; then
+		printf 'unknown\t'
+		return 0
+	fi
+	jq -r '
+		[ .[] | select(
+			(.path == ".github/workflows/release.yml")
+			or ((.name // "") | ascii_downcase) == "release"
+		) ] as $hits
+		| if ($hits | length) == 0 then "missing\t"
+		  else
+		    ($hits | map(select(.state == "active"))) as $active
+		    | if ($active | length) == 0 then "disabled\t"
+		      else
+		        ($active | map(select(.path == ".github/workflows/release.yml"))) as $file
+		        | if ($file | length) > 0 then "active\trelease.yml"
+		          else "active\t\($active[0].name)"
+		          end
+		      end
+		  end
+	' <<<"$json"
+}
+
+_repos_release_rollback() {
+	local why="$1"
+
+	trap - INT TERM
+	if [[ "${_REL_STATUS_OPEN:-0}" -eq 1 ]]; then
+		printf '\n' >&2
+		_REL_STATUS_OPEN=0
+	fi
+	warn "Aborting release of ${_REL_TAG}: $why"
+	if [[ "${_REL_RELEASE_LIVE:-0}" -eq 1 ]]; then
+		info "Cleanup" "deleting GitHub Release ${_REL_TAG}"
+		gh_release_delete "$_REL_REPO" "$_REL_TAG" || true
+		_REL_RELEASE_LIVE=0
+	fi
+	if [[ "${_REL_TAG_LIVE:-0}" -eq 1 ]]; then
+		info "Cleanup" "deleting tag ${_REL_TAG} (local + origin)"
+		git_tag_delete_local_remote "$_REL_DIR" "$_REL_TAG" || true
+		_REL_TAG_LIVE=0
+	fi
+	rm -f "${_REL_NOTES:-}"
+	displayError "Release aborted ($why). Tag and GitHub Release were removed if they had been created."
+	exit 1
+}
+
+_repos_release_on_int() {
+	_repos_release_rollback "interrupted with Ctrl-C"
+}
+
+# Dispatch release.yml on the tag and wait. 0 = ok or nothing to run.
+# Non-zero rolls the caller back (tag and Release already exist).
+_repos_release_dispatch() {
+	local repo="$1" tag="$2" sha="$3"
+	local kind wf run_id conclusion row
+	local live=0 start now elapsed status
+
+	row="$(_repos_release_workflow_kind "$repo")"
+	kind="${row%%$'\t'*}"
+	wf="${row#*$'\t'}"
+	case "$kind" in
+		missing)
+			warn "No workflow release.yml in $repo — release left in place"
+			return 0
+			;;
+		disabled)
+			warn "Workflow release.yml is disabled in $repo — release left in place"
+			return 0
+			;;
+		unknown)
+			warn "Could not list workflows in $repo — release left in place"
+			return 0
+			;;
+		active) ;;
+		*)
+			warn "Unexpected workflow state '$kind' — release left in place"
+			return 0
+			;;
+	esac
+	[[ -n "$wf" ]] || wf="release.yml"
+
+	info "Release workflow" "waiting for ${wf} on $tag"
+	if ! gh workflow run "$wf" --ref "$tag" --repo "$repo" >/dev/null 2>&1; then
+		_repos_release_rollback "could not start workflow ${wf}"
+	fi
+
+	[[ -t 2 ]] && live=1
+	_REL_STATUS_OPEN=0
+	start="$(date +%s)"
+	run_id=""
+	while [[ -z "$run_id" ]]; do
+		now="$(date +%s)"
+		elapsed=$((now - start))
+		if ((elapsed > 120)); then
+			if [[ "$_REL_STATUS_OPEN" -eq 1 ]]; then
+				printf '\n' >&2
+				_REL_STATUS_OPEN=0
+			fi
+			_repos_release_rollback "release workflow was dispatched but no run appeared"
+		fi
+		if [[ "$live" -eq 1 ]]; then
+			printf '\r  waiting for release workflow on %s… %ss   ' "$tag" "$elapsed" >&2
+			_REL_STATUS_OPEN=1
+		fi
+		run_id="$(
+			gh run list --repo "$repo" --workflow "$wf" --limit 20 \
+				--json databaseId,headSha,event,createdAt,headBranch 2>/dev/null \
+			| jq -r --arg sha "$sha" --arg tag "$tag" --argjson since "$((start - 30))" '
+				[ .[]
+				  | select(.event == "workflow_dispatch")
+				  | select(.headSha == $sha or .headBranch == $tag)
+				  | select(((.createdAt | sub("\\.[0-9]+"; "")) | fromdateiso8601) >= $since)
+				]
+				| sort_by(.createdAt)
+				| last
+				| .databaseId // empty
+			'
+		)" || true
+		[[ -n "$run_id" ]] && break
+		sleep 5
+	done
+
+	while true; do
+		now="$(date +%s)"
+		elapsed=$((now - start))
+		status=""
+		conclusion=""
+		if row="$(gh run view "$run_id" --repo "$repo" --json status,conclusion 2>/dev/null)"; then
+			status="$(jq -r '.status // empty' <<<"$row")"
+			conclusion="$(jq -r '.conclusion // empty' <<<"$row")"
+		fi
+		if [[ "$status" == "completed" ]]; then
+			if [[ "$_REL_STATUS_OPEN" -eq 1 ]]; then
+				printf '\n' >&2
+				_REL_STATUS_OPEN=0
+			fi
+			if [[ "$conclusion" == "success" ]]; then
+				return 0
+			fi
+			if [[ "$conclusion" == "cancelled" ]]; then
+				_repos_release_rollback "release workflow was cancelled"
+			fi
+			_repos_release_rollback "release workflow failed"
+		fi
+		if [[ "$live" -eq 1 ]]; then
+			printf '\r  waiting for release workflow on %s… %ss   ' "$tag" "$elapsed" >&2
+			_REL_STATUS_OPEN=1
+		fi
+		sleep 15
+	done
+}
+
 cmd_repos_release() {
 	local spec="" version="" do_list=0 do_delete=0 skip_ci=0
 	local dir repo ver_plain tag confirm has_release has_tag recreate=0
@@ -2653,6 +2817,9 @@ cmd_repos_release() {
 	printf '    tag:     %s\n' "$tag"
 	printf '    branch:  %s\n' "$branch"
 	[[ "$recreate" -eq 1 ]] && printf '    note:    existing tag/release will be recreated\n'
+	printf '    then:    dispatch workflow release.yml on that tag and wait\n'
+	printf '             (no such workflow: warning, Release stays)\n'
+	printf '             (run fails or Ctrl-C: tag and Release are removed)\n'
 	echo
 	printf '  --- release notes ---\n'
 	sed 's/^/  /' "$notes_file"
@@ -2662,7 +2829,7 @@ cmd_repos_release() {
 	[[ "$confirm" == "yes" ]] || { rm -f "$notes_file"; displayError "Aborted (confirmation was not exactly \"yes\")"; }
 
 	if [[ "$DRY_RUN" == "1" ]]; then
-		log "  [dry-run] pull --rebase, optional delete old tag/release, wait CI, tag, push, gh release create"
+		log "  [dry-run] pull --rebase, optional delete old tag/release, wait CI, tag, push, gh release create, dispatch release.yml"
 		ok "Dry-run complete"
 		rm -f "$notes_file"
 		LAST_COUNT=1
@@ -2704,6 +2871,14 @@ git push origin $tag
 gh release create $tag -R $repo --title \"Version $ver_plain\" --notes-file <notes>"
 	fi
 
+	_REL_TAG="$tag"
+	_REL_REPO="$repo"
+	_REL_DIR="$dir"
+	_REL_NOTES="$notes_file"
+	_REL_TAG_LIVE=1
+	_REL_RELEASE_LIVE=0
+	trap '_repos_release_on_int' INT TERM
+
 	version_is_prerelease "$ver_plain" && pre=1
 	[[ "$pre" -eq 1 ]] && info "Prerelease" "yes"
 	info "GitHub Release" "$tag"
@@ -2712,6 +2887,9 @@ gh release create $tag -R $repo --title \"Version $ver_plain\" --notes-file <not
 		displayError "gh release create failed — tag is on origin. Recover with:
 gh release create $tag -R $repo --title \"Version $ver_plain\" --notes-file <changelog-section>"
 	fi
+	_REL_RELEASE_LIVE=1
+	_repos_release_dispatch "$repo" "$tag" "$sha"
+	trap - INT TERM
 	rm -f "$notes_file"
 	ok "Released $tag → https://github.com/$repo/releases/tag/$tag"
 	LAST_COUNT=1

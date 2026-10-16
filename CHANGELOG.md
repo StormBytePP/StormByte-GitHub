@@ -22,8 +22,40 @@ modules follow recorded SHAs. Releases take notes from
 Commands, pin policy, and install: [README.md](README.md).
 
 ## [Unreleased]
+[Unreleased]: https://github.com/StormBytePP/StormByte-GitHub/compare/1.1.2...HEAD
 
-[Unreleased]: https://github.com/StormBytePP/StormByte-GitHub/compare/1.1.1...HEAD
+## [1.1.2] - 2026-10-16
+
+`repos release` now starts the repository's `release` workflow after the
+GitHub Release exists, and bash completion no longer dies under the shell
+options that used to abort it.
+
+Requires **StormByte-functions-bash ≥ 1.3.0**, **StormByte-functions-git ≥ 1.3.1**
+and **StormByte-functions-gh ≥ 1.0.0**.
+
+### Added
+
+- `repos release` dispatches workflow `release.yml` (or a workflow named
+  `Release`) on the new tag and waits for that run. If the run fails, is
+  cancelled, or the wait is interrupted with Ctrl-C, the tag and the GitHub
+  Release just created are deleted and the command aborts. A repository
+  with no such workflow, or with it disabled, prints a warning and leaves
+  the Release in place. `--skip-ci` still only skips the pre-tag CI wait.
+
+### Changed
+
+- `STORMBYTE_GITHUB_VERSION` `1.1.1` → `1.1.2`.
+- Help, man page and README describe the release-workflow wait, including
+  what Ctrl-C does before the tag exists and after the Release exists.
+
+### Fixed
+
+- Bash completion no longer aborts when the interactive shell has `set -e`,
+  `set -u`, `pipefail` or `failglob`. `--name=*` is matched as a pattern
+  instead of a filename glob. Submodule names that contain spaces complete
+  as one word.
+
+[1.1.2]: https://github.com/StormBytePP/StormByte-GitHub/compare/1.1.1...1.1.2
 
 ## [1.1.1] - 2026-09-01
 

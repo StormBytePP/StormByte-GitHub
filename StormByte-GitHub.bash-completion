@@ -1,5 +1,5 @@
 # StormByte-GitHub.bash-completion
-# Bash completion for StormByte-GitHub 1.1.0
+# Bash completion for StormByte-GitHub 1.1.2
 #
 # Install as:
 #   /usr/share/bash-completion/completions/StormByte-GitHub
@@ -14,6 +14,14 @@ _StormByte_GitHub() {
 	local -a top_cmds cache_subs ci_subs submodules_subs git_subs repos_subs fork_subs test_subs dump_extra
 
 	COMPREPLY=()
+
+	# Interactive shells often have -e, -u, pipefail or history expansion.
+	# local - restores the previous set options when this function returns.
+	local -
+	set +e
+	set +u
+	set +o pipefail
+	set +H
 
 	if declare -F _get_comp_words_by_ref >/dev/null 2>&1; then
 		_get_comp_words_by_ref -n : cur prev words cword
@@ -53,7 +61,7 @@ _StormByte_GitHub() {
 		local needle="$1"
 		local i
 		for ((i = 1; i < cword; i++)); do
-			[[ "${words[i]}" == "$needle" ]] && return 0
+			[[ "${words[i]}" == $needle ]] && return 0
 		done
 		return 1
 	}
@@ -163,7 +171,7 @@ _StormByte_GitHub() {
 		done
 
 		if ((${#COMPREPLY[@]} > 0)); then
-			compopt -o nospace 2>/dev/null
+			compopt -o nospace 2>/dev/null || true
 		fi
 	}
 
@@ -173,7 +181,7 @@ _StormByte_GitHub() {
 		mapfile -t COMPREPLY < <(compgen -f -- "$cur")
 		if ((${#COMPREPLY[@]} == 1)) && [[ -d "${COMPREPLY[0]}" ]]; then
 			COMPREPLY[0]="${COMPREPLY[0]%/}/"
-			compopt -o nospace 2>/dev/null
+			compopt -o nospace 2>/dev/null || true
 		fi
 	}
 
@@ -211,7 +219,9 @@ _StormByte_GitHub() {
 			return 0
 		fi
 
-		mapfile -t COMPREPLY < <(compgen -W "$(_sb_github_repo_candidates "$root")" -- "$cur")
+		local blob=""
+		blob="$(_sb_github_repo_candidates "$root")"
+		mapfile -t COMPREPLY < <(compgen -W "$blob" -- "$cur")
 	}
 
 	_sb_complete_repo_spec() {
@@ -225,7 +235,12 @@ _StormByte_GitHub() {
 			return 0
 		fi
 
-		mapfile -t repos < <(_sb_github_repo_candidates "$root")
+		local blob=""
+		blob="$(_sb_github_repo_candidates "$root")"
+		repos=()
+		if [[ -n "$blob" ]]; then
+			mapfile -t repos <<< "$blob"
+		fi
 
 		if [[ "$cur" == '!'* ]]; then
 			for r in "${repos[@]}"; do
@@ -275,7 +290,7 @@ _StormByte_GitHub() {
 		done
 
 		if ((${#COMPREPLY[@]} > 0)); then
-			compopt -o nospace 2>/dev/null
+			compopt -o nospace 2>/dev/null || true
 		fi
 	}
 
@@ -335,6 +350,7 @@ _StormByte_GitHub() {
 			fi
 		done < "$repo_dir/.gitmodules"
 		((${#names[@]})) || return 0
+		local IFS=$'\n'
 		mapfile -t COMPREPLY < <(compgen -W "${names[*]}" -- "$cur")
 	}
 
@@ -452,7 +468,7 @@ _StormByte_GitHub() {
 				return 0
 			fi
 			if [[ "$cur" == -* ]]; then
-				if ! _sb_github_has_word --name && ! _sb_github_has_word --name=*; then
+				if ! _sb_github_has_word --name && ! _sb_github_has_word '--name=*'; then
 					mapfile -t COMPREPLY < <(compgen -W "--name" -- "$cur")
 				fi
 				return 0

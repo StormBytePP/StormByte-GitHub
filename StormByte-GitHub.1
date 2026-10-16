@@ -1,4 +1,4 @@
-.TH STORMBYTE-GITHUB 1 "September 2026" "StormByte-GitHub 1.1.1" "User Commands"
+.TH STORMBYTE-GITHUB 1 "October 2026" "StormByte-GitHub 1.1.2" "User Commands"
 .SH NAME
 StormByte-GitHub \- unified CLI for GitHub Actions caches, CI runs, git ops, pin-aware submodules, dumps, releases, forks and sanitizer tests
 .SH SYNOPSIS
@@ -17,7 +17,7 @@ re-pinning and details, source dumps, GitHub Releases, fork sync, code search,
 clone-all and AddressSanitizer / ThreadSanitizer test builds.
 .PP
 Version
-.BR 1.1.1
+.BR 1.1.2
 requires
 .B StormByte-functions-bash
 \(>= 1.3.0
@@ -632,7 +632,7 @@ Release notes come from that section.
 The command waits for CI on HEAD unless
 .B --skip-ci
 is given
-(Ctrl-C during the wait leaves no tag).
+(Ctrl-C during that wait leaves no tag).
 The same version deletes and recreates tag and Release.
 Pre-releases such as
 .B 1.0.0-rc.1
@@ -640,6 +640,17 @@ pass
 .B --prerelease
 to
 .BR gh .
+After the GitHub Release exists, the command dispatches workflow
+.B release.yml
+on that tag and waits for it.
+If that run fails, or the wait is interrupted with Ctrl-C, the tag and
+the Release just created are deleted and the command aborts.
+A repository with no
+.B release.yml
+workflow, or with that workflow disabled, prints a warning and leaves
+the Release in place.
+.B --skip-ci
+does not skip that dispatch.
 Confirmation must be exactly
 .BR yes .
 .B DRY_RUN=1
