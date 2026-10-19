@@ -631,7 +631,7 @@ an origin whose owner is one of the configured owners, and a non-empty
 section
 .BI "## [" version "] - YYYY-MM-DD" .
 Release notes come from that section.
-The command waits for push or pull-request CI on HEAD unless
+The command waits up to 3 hours for push or pull-request CI on HEAD unless
 .B --skip-ci
 is given.
 A
@@ -649,8 +649,8 @@ to
 .BR gh .
 After the GitHub Release exists, the command dispatches workflow
 .B release.yml
-on that tag and waits for it.
-If that run fails, or the wait is interrupted with Ctrl-C, the tag and
+on that tag and waits up to 3 hours for it.
+If that run fails, times out, or the wait is interrupted with Ctrl-C, the tag and
 the Release just created are deleted and the command aborts.
 A repository with no
 .B release.yml

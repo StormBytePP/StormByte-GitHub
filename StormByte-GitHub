@@ -452,12 +452,12 @@ ${_CLR_BOLD_CYAN}repos release${_CLR_RESET}  [dir-spec] [version] [--list | --de
 		<version body>
 	No Summary → notes are only the version body (same as before).
 	A missing or empty version section is still FATAL.
-	Waits for push/PR CI unless --skip-ci
+	Waits up to 3 hours for push/PR CI unless --skip-ci
 	(a workflow_dispatch on that commit, including Release, is not CI).
 	(Ctrl-C during that wait: no tag yet). Same version recreates tag/release.
 	Pre-releases (e.g. 1.0.0-rc.1) use gh --prerelease.
 	After the GitHub Release exists, dispatch workflow release.yml on that
-	tag and wait. If that run fails, or Ctrl-C while waiting, the tag and
+	tag and wait up to 3 hours. If that run fails, times out, or Ctrl-C while waiting, the tag and
 	Release just created are deleted and the command aborts.
 	No release.yml (or it is disabled): warning only; the Release stays.
 	--skip-ci does not skip that dispatch.
@@ -2601,7 +2601,7 @@ release_write_notes_file() {
 # Push/PR CI only. A workflow_dispatch on the same SHA (the Release
 # workflow, a manual re-run) is not the commit check and must not block.
 _wait_ci_green() {
-	local repo="$1" sha="$2" timeout="${3:-3600}"
+	local repo="$1" sha="$2" timeout="${3:-10800}"
 	local start now elapsed pending failed live=0 status_open=0 saw
 	local -a runs=()
 	local line st conc event name
@@ -2840,6 +2840,13 @@ _repos_release_dispatch() {
 				_repos_release_rollback "release workflow was cancelled"
 			fi
 			_repos_release_rollback "release workflow failed"
+		fi
+		if ((elapsed > 10800)); then
+			if [[ "$_REL_STATUS_OPEN" -eq 1 ]]; then
+				printf '\n' >&2
+				_REL_STATUS_OPEN=0
+			fi
+			_repos_release_rollback "release workflow timed out after 10800s"
 		fi
 		if [[ "$live" -eq 1 ]]; then
 			printf '\r  waiting for release workflow on %s… %ss   ' "$tag" "$elapsed" >&2

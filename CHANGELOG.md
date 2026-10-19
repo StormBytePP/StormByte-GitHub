@@ -24,7 +24,7 @@ Commands, pin policy, and install: [README.md](README.md).
 ## [Unreleased]
 [Unreleased]: https://github.com/StormBytePP/StormByte-GitHub/compare/1.1.2...HEAD
 
-## [1.1.2] - 2026-10-16
+## [1.1.2] - 2026-10-19
 
 `repos release` now starts the repository's `release` workflow after the GitHub Release exists, and `OWNER` may list more than one GitHub account.
 
@@ -44,6 +44,7 @@ Requires **StormByte-functions-bash ≥ 1.3.0**, **StormByte-functions-git ≥ 1
 
 - Bash completion no longer aborts when the interactive shell has `set -e`, `set -u`, `pipefail` or `failglob`. `--name=*` is matched as a pattern instead of a filename glob. Submodule names that contain spaces complete as one word.
 - `repos release` treats only push and pull-request runs as CI. A failed `workflow_dispatch` on the same commit (the Release workflow) no longer aborts the release while GitHub shows the CI checks green.
+- `repos release` waits up to 3 hours for push/PR CI and, separately, up to 3 hours for the `release.yml` run. The previous CI limit was 1 hour, so a Multimedia build aborted the release while the workflow was still going. A release-workflow timeout deletes the tag and the GitHub Release just created, same as a failed run.
 
 [1.1.2]: https://github.com/StormBytePP/StormByte-GitHub/compare/1.1.1...1.1.2
 
